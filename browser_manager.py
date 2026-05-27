@@ -166,6 +166,32 @@ class BrowserManager:
         except Exception:
             return ""
 
+    async def _handle_personality_popup(self):
+        """Иногда отвечает на поп-ап 'Do you like this personality?' (мимикрия)."""
+        try:
+            present = await self.page.evaluate(
+                "document.querySelector('button[aria-label=\"Yes, I like this personality\"]') ? true : false"
+            )
+            if not present:
+                return
+            if random.random() < 0.7:
+                await self.page.evaluate(
+                    "document.querySelector('button[aria-label=\"Yes, I like this personality\"]').click()"
+                )
+                logger.info("Поп-ап personality: палец вверх")
+            else:
+                await self.page.evaluate("""
+                    (() => {
+                        const btn = document.querySelector('button[aria-label="Yes, I like this personality"]');
+                        const box = btn ? btn.closest('div') : null;
+                        const x = box ? box.querySelector('button[aria-label*="lose"], button[aria-label*="ismiss"]') : null;
+                        if (x) x.click();
+                    })()
+                """)
+                logger.info("Поп-ап personality: закрыт без оценки")
+        except Exception:
+            pass
+
     async def _collect_files(self) -> str:
         out = ""
         try:
@@ -331,3 +357,6 @@ class BrowserManager:
             file_blob = await self._collect_files()
             if file_blob:
                 yield file_blob
+
+            # Иногда реагируем на поп-ап про personality (человечность)
+            await self._handle_personality_popup()
