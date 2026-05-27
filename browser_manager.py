@@ -309,8 +309,14 @@ class BrowserManager:
                         const msgs = document.querySelectorAll('div[data-message-author-role="assistant"]');
                         if (!msgs.length) return;
                         const last = msgs[msgs.length - 1];
-                        const clickables = last.querySelectorAll('a[download], button[aria-label*="ownload"], button[aria-label*="качать"]');
-                        clickables.forEach(el => { try { el.click(); } catch(e){} });
+                        last.querySelectorAll('button, a').forEach(el => {
+                            const t = (el.innerText || '').toLowerCase();
+                            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                            if (el.classList.contains('behavior-btn') || t.includes('скачать') ||
+                                t.includes('download') || aria.includes('download') || el.hasAttribute('download')) {
+                                try { el.click(); } catch(e){}
+                            }
+                        });
                     })()
                 """)
             except Exception:
