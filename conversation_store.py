@@ -50,13 +50,25 @@ class ConversationStore:
             out.append(hash_message(role, content))
         return out
 
+    def _sig_hashes(self, messages) -> List[str]:
+        """Подпись диалога: только user/assistant. system/tools волатильны в IDE
+        (дата, открытые файлы, cwd) — их игнорируем, иначе каждый запрос = новый чат."""
+        out = []
+        for m in messages:
+            role = m.role if hasattr(m, "role") else m["role"]
+            if role not in ("user", "assistant"):
+                continue
+            content = m.content if hasattr(m, "content") else m["content"]
+            out.append(hash_message(role, content))
+        return out
+
     def match(self, messages) -> Tuple[bool, list, Optional[str], Optional[int]]:
         """Возвращает (is_new_chat, delta_messages, chat_url, row_id).
 
         Ищет сохранённый диалог, чей список хэшей — префикс входящих сообщений.
         Берёт самый длинный (самый специфичный) матч.
         """
-        incoming = self._msg_hashes(messages)
+        incoming = self._sig_hashes(messages)
         best = None  # (row_id, stored_hashes, chat_url)
         with self._lock, closing(self._conn()) as conn, conn:
             rows = conn.execute(
@@ -64,7 +76,7 @@ class ConversationStore:
             ).fetchall()
         for row_id, chat_url, hashes_json in rows:
             stored = json.loads(hashes_json)
-            if len(stored) > len(incoming):
+            if not stored or len(stored) > len(incoming):
                 continue
             if incoming[: len(stored)] == stored:
                 if best is None or len(stored) > len(best[1]):
@@ -72,12 +84,14 @@ class ConversationStore:
         if best is None:
             return True, list(messages), None, None
         row_id, stored, chat_url = best
-        delta = list(messages)[len(stored):]
+        ua = [m for m in messages
+              if (m.role if hasattr(m, "role") else m["role"]) in ("user", "assistant")]
+        delta = ua[len(stored):]
         return False, delta, chat_url, row_id
 
     def upsert(self, row_id: Optional[int], messages, assistant_reply: str,
                chat_url: Optional[str]) -> int:
-        hashes = self._msg_hashes(messages)
+        hashes = self._sig_hashes(messages)
         hashes.append(hash_message("assistant", assistant_reply))
         payload = json.dumps(hashes)
         now = time.time()
