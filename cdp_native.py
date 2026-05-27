@@ -101,19 +101,14 @@ def html_to_text(html: str) -> str:
 
 
 async def read_last_assistant(page) -> str:
-    """Текст последнего сообщения ассистента через CDP DOM.getOuterHTML (без JS)."""
+    """Текст последнего сообщения ассистента. Чтение через evaluate (быстро;
+    страница не видит CDP-чтения). Весь ВВОД остаётся нативным."""
     try:
-        els = await page.select_all('div[data-message-author-role="assistant"]')
-        if not els:
-            return ""
-        last = els[-1]
-        target = last
-        try:
-            inner = await last.query_selector(".markdown")
-            if inner:
-                target = inner
-        except Exception:
-            pass
-        return html_to_text(await target.get_html())
+        txt = await page.evaluate(
+            '(() => { const m = document.querySelectorAll(\'div[data-message-author-role="assistant"]\');'
+            ' if (!m.length) return ""; const last = m[m.length-1];'
+            ' const md = last.querySelector(".markdown"); return (md || last).innerText || ""; })()'
+        )
+        return txt or ""
     except Exception:
         return ""

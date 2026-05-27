@@ -3,6 +3,7 @@ import asyncio
 import random
 import os
 import shutil
+import time
 import warnings
 from loguru import logger
 import nodriver as uc
@@ -69,7 +70,10 @@ class BrowserManager:
         return current_url(self.page)
 
     async def select_model(self, target_model: str):
-        """Открывает селектор модели и кликает нужный пункт — реальной мышью, без JS."""
+        """Выбор модели реальной мышью. Instant — дефолт, выбор не нужен."""
+        if "instant" in target_model.lower():
+            logger.info("Модель Instant (по умолчанию) — выбор пропущен")
+            return
         try:
             buttons = await self.page.select_all("button")
         except Exception:
@@ -156,20 +160,23 @@ class BrowserManager:
                 await send_key(self.page, "Enter", 13)
 
             logger.info("Запрос отправлен. Ждём генерацию...")
-            elapsed = 0.0
-            while elapsed < 20:
-                if await find_element(self.page, STOP_SELECTOR, timeout=0.3):
-                    break
-                await asyncio.sleep(0.5)
-                elapsed += 0.5
+            interval = 0.4
+            start = time.time()
+            last_change = start
+            last_scroll = start
+            seen_activity = False
+            last_text = await read_last_assistant(self.page)  # базовый текст (для продолжения чата)
+            while time.time() - start < GENERATION_TIMEOUT:
+                stop_present = False
+                try:
+                    stop_present = bool(await self.page.evaluate(
+                        'document.querySelector(\'button[aria-label="Stop generating"], button[data-testid="stop-button"]\') ? true : false'
+                    ))
+                except Exception:
+                    pass
 
-            elapsed = 0.0
-            last_text = ""
-            while elapsed < GENERATION_TIMEOUT:
-                if int(elapsed * 10) % 30 == 0:
-                    await scroll_bottom(self.page)
                 current_text = await read_last_assistant(self.page)
-                if current_text and current_text != last_text:
+                if current_text != last_text:
                     i = 0
                     n = min(len(last_text), len(current_text))
                     while i < n and last_text[i] == current_text[i]:
@@ -178,15 +185,26 @@ class BrowserManager:
                     last_text = current_text
                     if chunk:
                         yield chunk
+                    seen_activity = True
+                    last_change = time.time()
 
-                stop_present = bool(await find_element(self.page, STOP_SELECTOR, timeout=0.2))
-                if not stop_present:
-                    send_el = await find_element(self.page, SEND_SELECTOR, timeout=0.2)
-                    if send_el or elapsed > 5:
-                        logger.info("Генерация завершена.")
-                        break
-                await asyncio.sleep(0.3)
-                elapsed += 0.3
+                if stop_present:
+                    seen_activity = True
+                    last_change = time.time()
+
+                # завершено: есть непустой текст ответа, Stop исчез, текст стабилен ~2с
+                if last_text and not stop_present and (time.time() - last_change) >= 2.0:
+                    logger.info("Генерация завершена.")
+                    break
+                # ответ так и не появился — не висим
+                if not last_text and (time.time() - start) > 25:
+                    logger.warning("Ответ не появился за 25с — выходим.")
+                    break
+
+                if time.time() - last_scroll >= 3.0:
+                    await scroll_bottom(self.page)
+                    last_scroll = time.time()
+                await asyncio.sleep(interval)
 
             await scroll_bottom(self.page)
             await asyncio.sleep(0.5)
