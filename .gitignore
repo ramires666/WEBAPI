@@ -4,6 +4,7 @@ Profile 2/
 Profile_Fixed/
 
 # Runtime / временное
+proxy_state.db
 temp_downloads/
 temp/
 __pycache__/

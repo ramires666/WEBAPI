@@ -205,7 +205,7 @@ class BrowserManager:
             pass
         return ""
 
-    async def send_prompt_and_stream(self, prompt_text: str, target_model: str, is_new_chat: bool):
+    async def send_prompt_and_stream(self, prompt_text: str, target_model: str, is_new_chat: bool, chat_url: str = None):
         async with self._lock:
             if is_new_chat:
                 logger.info("=== НАЧАЛО НОВОГО ЧАТА ===")
@@ -213,7 +213,12 @@ class BrowserManager:
                 await asyncio.sleep(3.5)
                 await self.select_model(target_model)
             else:
-                logger.info("=== ПРОДОЛЖЕНИЕ ТЕКУЩЕГО ЧАТА ===")
+                if chat_url:
+                    logger.info("=== ПЕРЕХОД В ЧАТ {} ===", chat_url)
+                    await self.page.get(chat_url)
+                    await asyncio.sleep(3.0)
+                else:
+                    logger.info("=== ПРОДОЛЖЕНИЕ ТЕКУЩЕГО ЧАТА ===")
             
             textarea = await find_element(self.page, "#prompt-textarea", timeout=10)
             if not textarea:
