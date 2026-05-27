@@ -23,9 +23,9 @@ class ChatCompletionRequest(BaseModel):
 
 current_state = ConversationStore()
 
-def format_delta_prompt(delta_messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None) -> str:
+def format_delta_prompt(delta_messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None, is_new_chat: bool = False) -> str:
     prompt = ""
-    if tools:
+    if tools and is_new_chat:
         tools_desc = json.dumps(tools, ensure_ascii=False, indent=2)
         prompt += (
             "[SYSTEM INSTRUCTION]\nТебе доступны следующие инструменты (Tool Use). "
@@ -40,7 +40,8 @@ def format_delta_prompt(delta_messages: List[ChatMessage], tools: Optional[List[
             content = " ".join([p.get("text", "") for p in content if p.get("type") == "text"])
         
         if msg.role == "system":
-            prompt += f"[SYSTEM]: {content}\n\n"
+            if is_new_chat:
+                prompt += f"[SYSTEM]: {content}\n\n"
         elif msg.role == "user":
             prompt += f"{content}\n\n"
         elif msg.role == "assistant":
@@ -61,19 +62,19 @@ async def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": "gpt-4o", "object": "model", "created": 1715367049, "owned_by": "system"},
-            {"id": "o1", "object": "model", "created": 1715367049, "owned_by": "system"}
+            {"id": "Instant", "object": "model", "created": 1715367049, "owned_by": "system"},
+            {"id": "Thinking", "object": "model", "created": 1715367049, "owned_by": "system"}
         ]
     }
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    target_model = "Thinking" if "o1" in request.model.lower() else "Instant"
+    target_model = "Thinking" if "thinking" in request.model.lower() else "Instant"
     
     is_new_chat, delta_messages, chat_url, row_id = current_state.match(request.messages)
     
     # Склеиваем только дельту! Если is_new_chat, склеится вся история.
-    prompt_text = format_delta_prompt(delta_messages, request.tools)
+    prompt_text = format_delta_prompt(delta_messages, request.tools, is_new_chat)
     
     if request.stream:
         async def event_generator():

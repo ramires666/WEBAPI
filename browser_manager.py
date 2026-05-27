@@ -174,7 +174,7 @@ class BrowserManager:
             )
             if not present:
                 return
-            if random.random() < 0.7:
+            if random.random() < 0.35:
                 await self.page.evaluate(
                     "document.querySelector('button[aria-label=\"Yes, I like this personality\"]').click()"
                 )
