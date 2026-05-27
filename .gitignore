@@ -1,0 +1,17 @@
+# Chrome профили — приватные куки/логин, НЕ коммитить
+chrome_work_profile/
+Profile 2/
+Profile_Fixed/
+
+# Runtime / временное
+temp_downloads/
+temp/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Дампы и артефакты
+*.log
+result.txt
+*_dump.html
