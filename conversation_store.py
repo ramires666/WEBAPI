@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import hashlib
+import re
 import time
 import threading
 from contextlib import closing
@@ -9,17 +10,52 @@ from typing import List, Optional, Tuple, Any
 DB_PATH = r"W:\_python\APIPROXY\proxy_state.db"
 
 
-def hash_message(role: str, content: Any) -> str:
+def _text(content: Any) -> str:
     if isinstance(content, list):
-        content = " ".join(
+        return " ".join(
             p.get("text", "") for p in content
             if isinstance(p, dict) and p.get("type") == "text"
         )
-    return hashlib.md5(f"{role}:{content}".encode("utf-8")).hexdigest()
+    return content or ""
+
+
+def hash_message(role: str, content: Any) -> str:
+    return hashlib.md5(f"{role}:{_text(content)}".encode("utf-8")).hexdigest()
+
+
+# Маркеры известных IDE (устойчивые подстроки названия продукта в system-промпте).
+# Список расширяется по мере появления новых клиентов.
+_CLIENT_MARKERS = [
+    ("kilocode", ("kilo code", "kilocode", "you are kilo")),
+    ("opencode", ("opencode",)),
+    ("cline", ("cline",)),
+    ("roo", ("roo code", "roo cline", "roocode")),
+    ("cursor", ("cursor",)),
+    ("continue", ("continue.dev",)),
+    ("aider", ("aider",)),
+]
+
+
+def client_fingerprint(messages) -> str:
+    """Идентификатор IDE по устойчивому маркеру названия продукта в system.
+    Маркер не волатилен -> client_id стабилен -> продолжение чата не ломается.
+    Неизвестный клиент -> 'generic' (тоже стабилен)."""
+    sys_txt = ""
+    for m in messages:
+        role = m.role if hasattr(m, "role") else m["role"]
+        if role == "system":
+            sys_txt += _text(m.content if hasattr(m, "content") else m["content"]) + "\n"
+    if not sys_txt.strip():
+        return "default"
+    low = sys_txt.lower()
+    for cid, marks in _CLIENT_MARKERS:
+        if any(mk in low for mk in marks):
+            return cid
+    return "generic"
 
 
 class ConversationStore:
-    """Персистентное сопоставление диалогов с URL чатов ChatGPT (SQLite)."""
+    """Сопоставление диалогов с URL чатов ChatGPT (SQLite), namespace по IDE."""
 
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
@@ -35,6 +71,7 @@ class ConversationStore:
                 """
                 CREATE TABLE IF NOT EXISTS conversations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_id TEXT NOT NULL,
                     chat_url TEXT,
                     hashes_json TEXT NOT NULL,
                     updated_at REAL NOT NULL
@@ -42,37 +79,28 @@ class ConversationStore:
                 """
             )
 
-    def _msg_hashes(self, messages) -> List[str]:
-        out = []
-        for m in messages:
-            role = m.role if hasattr(m, "role") else m["role"]
-            content = m.content if hasattr(m, "content") else m["content"]
-            out.append(hash_message(role, content))
-        return out
-
     def _sig_hashes(self, messages) -> List[str]:
-        """Подпись диалога: только user/assistant. system/tools волатильны в IDE
-        (дата, открытые файлы, cwd) — их игнорируем, иначе каждый запрос = новый чат."""
+        """Подпись диалога: только user/assistant (system/tools волатильны)."""
         out = []
         for m in messages:
             role = m.role if hasattr(m, "role") else m["role"]
             if role not in ("user", "assistant"):
                 continue
-            content = m.content if hasattr(m, "content") else m["content"]
-            out.append(hash_message(role, content))
+            out.append(hash_message(role, m.content if hasattr(m, "content") else m["content"]))
         return out
 
     def match(self, messages) -> Tuple[bool, list, Optional[str], Optional[int]]:
-        """Возвращает (is_new_chat, delta_messages, chat_url, row_id).
+        """(is_new_chat, delta_messages, chat_url, row_id).
 
-        Ищет сохранённый диалог, чей список хэшей — префикс входящих сообщений.
-        Берёт самый длинный (самый специфичный) матч.
-        """
+        Беседа ищется ТОЛЬКО внутри своей IDE (client_id из system) по префиксу
+        подписи user/assistant — «привет» из разных IDE не схлопывается."""
+        cid = client_fingerprint(messages)
         incoming = self._sig_hashes(messages)
-        best = None  # (row_id, stored_hashes, chat_url)
+        best = None
         with self._lock, closing(self._conn()) as conn, conn:
             rows = conn.execute(
-                "SELECT id, chat_url, hashes_json FROM conversations"
+                "SELECT id, chat_url, hashes_json FROM conversations WHERE client_id = ?",
+                (cid,),
             ).fetchall()
         for row_id, chat_url, hashes_json in rows:
             stored = json.loads(hashes_json)
@@ -91,6 +119,7 @@ class ConversationStore:
 
     def upsert(self, row_id: Optional[int], messages, assistant_reply: str,
                chat_url: Optional[str]) -> int:
+        cid = client_fingerprint(messages)
         hashes = self._sig_hashes(messages)
         hashes.append(hash_message("assistant", assistant_reply))
         payload = json.dumps(hashes)
@@ -98,8 +127,8 @@ class ConversationStore:
         with self._lock, closing(self._conn()) as conn, conn:
             if row_id is None:
                 cur = conn.execute(
-                    "INSERT INTO conversations (chat_url, hashes_json, updated_at) VALUES (?, ?, ?)",
-                    (chat_url, payload, now),
+                    "INSERT INTO conversations (client_id, chat_url, hashes_json, updated_at) VALUES (?, ?, ?, ?)",
+                    (cid, chat_url, payload, now),
                 )
                 return cur.lastrowid
             conn.execute(
