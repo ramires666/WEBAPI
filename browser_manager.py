@@ -1,3 +1,4 @@
+"""Управление браузером и оркестрация диалога с ChatGPT — 100% нативный CDP, без JS."""
 import asyncio
 import random
 import os
@@ -5,52 +6,26 @@ import shutil
 import warnings
 from loguru import logger
 import nodriver as uc
-import nodriver.cdp.input_ as cdp_input
 import nodriver.cdp.browser as cdp_browser
 
-# Suppress warnings
+from config import (
+    ORIGINAL_CHROME_USER_DATA, WORKING_PROFILE_DIR, CHROME_PROFILE_NAME,
+    CHATGPT_URL, GENERATION_TIMEOUT, TEMP_DOWNLOADS,
+)
+from cdp_native import (
+    send_key, human_type, insert_text_fast, click_element, find_element,
+    scroll_bottom, current_url, read_last_assistant,
+)
+from file_extractor import click_download_buttons, collect_files
+
 warnings.filterwarnings('ignore', category=ResourceWarning)
 
-ORIGINAL_CHROME_USER_DATA = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
-WORKING_PROFILE_DIR = r"W:\_python\APIPROXY\chrome_work_profile"
-CHROME_PROFILE_NAME = "Profile 2"
-CHATGPT_URL = "https://chatgpt.com"
-GENERATION_TIMEOUT = 300
-TEMP_DOWNLOADS = r"W:\_python\APIPROXY\temp_downloads"
-TYPING_DELAY = (0.01, 0.05)
+STOP_SELECTOR = 'button[aria-label="Stop generating"], button[data-testid="stop-button"]'
+SEND_SELECTOR = '[data-testid="send-button"], button[data-testid="composer-send-button"]'
+COMPOSER_SELECTOR = "#prompt-textarea"
+PERSONALITY_YES = 'button[aria-label="Yes, I like this personality"]'
+MODEL_KEYWORDS = ("instant", "thinking", "auto", "gpt", "chatgpt", "model", "модель")
 
-async def send_key(page, key_name: str, key_code: int):
-    await page.send(cdp_input.dispatch_key_event(
-        type_="keyDown",
-        key=key_name,
-        windows_virtual_key_code=key_code,
-        native_virtual_key_code=key_code
-    ))
-    await asyncio.sleep(0.05)
-    await page.send(cdp_input.dispatch_key_event(
-        type_="keyUp",
-        key=key_name,
-        windows_virtual_key_code=key_code,
-        native_virtual_key_code=key_code
-    ))
-
-async def human_type(element, text: str) -> None:
-    for char in text:
-        await element.send_keys(char)
-        await asyncio.sleep(random.uniform(*TYPING_DELAY))
-
-async def find_element(page, selector: str, *, timeout: float = 10.0, interval: float = 0.3):
-    elapsed = 0.0
-    while elapsed < timeout:
-        try:
-            el = await page.select(selector, timeout=0.5)
-            if el:
-                return el
-        except Exception:
-            pass
-        await asyncio.sleep(interval)
-        elapsed += interval
-    return None
 
 class BrowserManager:
     def __init__(self):
@@ -65,7 +40,6 @@ class BrowserManager:
         dst_local_state = os.path.join(WORKING_PROFILE_DIR, "Local State")
         if os.path.exists(src_local_state):
             shutil.copy2(src_local_state, dst_local_state)
-        
         src_profile = os.path.join(ORIGINAL_CHROME_USER_DATA, CHROME_PROFILE_NAME)
         dst_profile = os.path.join(WORKING_PROFILE_DIR, CHROME_PROFILE_NAME)
         if os.path.exists(src_profile) and not os.path.exists(dst_profile):
@@ -90,146 +64,62 @@ class BrowserManager:
     async def stop_browser(self):
         if self.browser:
             self.browser.stop()
-            
-    async def select_model(self, target_model: str):
-        logger.info("Поиск кнопки модели в композиторе...")
-        btn_text = await self.page.evaluate("""
-            (() => {
-                const textarea = document.querySelector("#prompt-textarea");
-                if (!textarea) return "Error";
-                const composer = textarea.closest('form') || textarea.parentElement;
-                if (!composer) return "Error";
-                const buttons = Array.from(composer.querySelectorAll('button'));
-                let selector_btn = null;
-                for (const btn of buttons) {
-                    const text = (btn.innerText || '').trim().toLowerCase();
-                    if (text.includes("project")) continue;
-                    const isSend = btn.getAttribute('data-testid') === 'send-button';
-                    if (["instant", "thinking", "pro", "model", "auto-switch", "модель"].some(k => text.includes(k)) && !isSend) {
-                        selector_btn = btn; break;
-                    }
-                }
-                if (selector_btn) {
-                    selector_btn.focus();
-                    selector_btn.click();
-                    return selector_btn.innerText;
-                }
-                return "Error";
-            })()
-        """)
-        if btn_text == "Error":
-            return
-            
-        await asyncio.sleep(1.5)
-        model_selected = False
-        
-        # Вниз
-        for i in range(8):
-            await send_key(self.page, "ArrowDown", 40)
-            await asyncio.sleep(0.3)
-            active_text = await self.page.evaluate("document.activeElement ? document.activeElement.innerText : ''")
-            if active_text and target_model.lower() in active_text.lower() and 'project' not in active_text.lower():
-                await send_key(self.page, "Enter", 13)
-                await asyncio.sleep(1.5)
-                model_selected = True
-                break
-                
-        if not model_selected:
-            # Вверх
-            for i in range(8):
-                await send_key(self.page, "ArrowUp", 38)
-                await asyncio.sleep(0.3)
-                active_text = await self.page.evaluate("document.activeElement ? document.activeElement.innerText : ''")
-                if active_text and target_model.lower() in active_text.lower() and 'project' not in active_text.lower():
-                    await send_key(self.page, "Enter", 13)
-                    await asyncio.sleep(1.5)
-                    break
-
-    async def _scroll_to_bottom(self):
-        try:
-            await self.page.evaluate("""
-                (() => {
-                    const scrollables = Array.from(document.querySelectorAll('*')).filter(e => {
-                        const s = window.getComputedStyle(e);
-                        return (s.overflowY === 'auto' || s.overflowY === 'scroll') && e.scrollHeight > e.clientHeight;
-                    });
-                    scrollables.forEach(c => c.scrollTo({ top: c.scrollHeight, behavior: 'smooth' }));
-                    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-                })()
-            """)
-        except Exception:
-            pass
 
     async def get_current_url(self) -> str:
+        return current_url(self.page)
+
+    async def select_model(self, target_model: str):
+        """Открывает селектор модели и кликает нужный пункт — реальной мышью, без JS."""
         try:
-            return await self.page.evaluate("location.href")
+            buttons = await self.page.select_all("button")
         except Exception:
-            return ""
+            buttons = []
+        selector_btn = None
+        for b in buttons or []:
+            try:
+                t = (b.text_all or "").lower()
+                if b.attrs.get("data-testid") == "send-button":
+                    continue
+                if "project" in t:
+                    continue
+                if any(k in t for k in MODEL_KEYWORDS):
+                    selector_btn = b
+                    break
+            except Exception:
+                continue
+        if not selector_btn or not await click_element(selector_btn):
+            logger.warning("Кнопка выбора модели не найдена")
+            return
+        await asyncio.sleep(1.2)
+        try:
+            items = await self.page.select_all('[role="menuitem"], [role="option"]')
+        except Exception:
+            items = []
+        for it in items or []:
+            try:
+                t = (it.text_all or "").lower()
+                if target_model.lower() in t and "project" not in t:
+                    await click_element(it)
+                    await asyncio.sleep(1.0)
+                    logger.info("Модель выбрана: {}", target_model)
+                    return
+            except Exception:
+                continue
+        logger.warning("Пункт модели '{}' не найден в меню", target_model)
 
     async def _handle_personality_popup(self):
-        """Иногда отвечает на поп-ап 'Do you like this personality?' (мимикрия)."""
+        """Иногда (35%) кликает 'палец вверх' на поп-апе personality — мышью."""
         try:
-            present = await self.page.evaluate(
-                "document.querySelector('button[aria-label=\"Yes, I like this personality\"]') ? true : false"
-            )
-            if not present:
+            btn = await find_element(self.page, PERSONALITY_YES, timeout=0.5)
+            if not btn:
                 return
             if random.random() < 0.35:
-                await self.page.evaluate(
-                    "document.querySelector('button[aria-label=\"Yes, I like this personality\"]').click()"
-                )
-                logger.info("Поп-ап personality: палец вверх")
+                if await click_element(btn):
+                    logger.info("Поп-ап personality: палец вверх")
             else:
-                await self.page.evaluate("""
-                    (() => {
-                        const btn = document.querySelector('button[aria-label="Yes, I like this personality"]');
-                        const box = btn ? btn.closest('div') : null;
-                        const x = box ? box.querySelector('button[aria-label*="lose"], button[aria-label*="ismiss"]') : null;
-                        if (x) x.click();
-                    })()
-                """)
-                logger.info("Поп-ап personality: закрыт без оценки")
+                logger.info("Поп-ап personality: пропускаем")
         except Exception:
             pass
-
-    async def _collect_files(self) -> str:
-        out = ""
-        try:
-            files = [f for f in os.listdir(TEMP_DOWNLOADS) if os.path.isfile(os.path.join(TEMP_DOWNLOADS, f))]
-        except Exception:
-            files = []
-        for name in files:
-            if name.endswith(".crdownload") or name.endswith(".tmp"):
-                continue
-            path = os.path.join(TEMP_DOWNLOADS, name)
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    code = f.read()
-                ext = os.path.splitext(name)[1].lstrip(".") or "text"
-                lang = "python" if ext in ("py", "pyw") else ext
-                out += f"\n\n[Скачанный файл: {name}]\n```{lang}\n{code}\n```"
-            except Exception as e:
-                logger.warning("Не прочитать файл {}: {}", name, e)
-            finally:
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-        if out:
-            return out
-        try:
-            canvas_code = await self.page.evaluate("""
-                (() => {
-                    const cm = document.querySelector('.cm-content');
-                    if (!cm) return '';
-                    return cm.innerText || '';
-                })()
-            """)
-            if canvas_code and canvas_code.strip():
-                return f"\n\n[Canvas]\n```python\n{canvas_code.strip()}\n```"
-        except Exception:
-            pass
-        return ""
 
     async def send_prompt_and_stream(self, prompt_text: str, target_model: str, is_new_chat: bool, chat_url: str = None):
         async with self._lock:
@@ -238,125 +128,72 @@ class BrowserManager:
                 await self.page.get(CHATGPT_URL)
                 await asyncio.sleep(3.5)
                 await self.select_model(target_model)
+            elif chat_url:
+                logger.info("=== ПЕРЕХОД В ЧАТ {} ===", chat_url)
+                await self.page.get(chat_url)
+                await asyncio.sleep(3.0)
             else:
-                if chat_url:
-                    logger.info("=== ПЕРЕХОД В ЧАТ {} ===", chat_url)
-                    await self.page.get(chat_url)
-                    await asyncio.sleep(3.0)
-                else:
-                    logger.info("=== ПРОДОЛЖЕНИЕ ТЕКУЩЕГО ЧАТА ===")
-            
-            textarea = await find_element(self.page, "#prompt-textarea", timeout=10)
+                logger.info("=== ПРОДОЛЖЕНИЕ ТЕКУЩЕГО ЧАТА ===")
+
+            textarea = await find_element(self.page, COMPOSER_SELECTOR, timeout=10)
             if not textarea:
                 yield "Error: prompt textarea not found"
                 return
-                
+
             logger.info("Ввод промпта (длина {} символов)...", len(prompt_text))
-            await textarea.click()
-            await asyncio.sleep(0.5)
-            # ChatGPT composer = contenteditable div (ProseMirror), .value не работает.
-            # Длинный текст вставляем через CDP Input.insertText, короткий — посимвольно.
+            await click_element(textarea)
+            await asyncio.sleep(0.4)
             if len(prompt_text) > 2000:
-                logger.info("Длинный текст — вставка через CDP Input.insertText...")
-                await self.page.evaluate("document.querySelector('#prompt-textarea').focus()")
-                await asyncio.sleep(0.2)
-                await self.page.send(cdp_input.insert_text(text=prompt_text))
-                await asyncio.sleep(1)
+                logger.info("Длинный текст — нативная вставка insert_text...")
+                await insert_text_fast(self.page, prompt_text)
+                await asyncio.sleep(0.8)
             else:
                 await human_type(textarea, prompt_text)
-                
-            await asyncio.sleep(1.0)
-            send_btn = await find_element(self.page, '[data-testid="send-button"]', timeout=3)
-            if send_btn:
-                await send_btn.click()
-            else:
+
+            await asyncio.sleep(0.8)
+            send_btn = await find_element(self.page, SEND_SELECTOR, timeout=3)
+            if not await click_element(send_btn):
                 await send_key(self.page, "Enter", 13)
-                
-            logger.info("Запрос отправлен. Ждем генерацию...")
-            
+
+            logger.info("Запрос отправлен. Ждём генерацию...")
             elapsed = 0.0
-            last_text = ""
-            
-            # Ожидание начала генерации
             while elapsed < 20:
-                try:
-                    stop_btn = await self.page.select('button[aria-label="Stop generating"], button[data-testid="stop-button"]', timeout=0.3)
-                    if stop_btn:
-                        break
-                except Exception:
-                    pass
+                if await find_element(self.page, STOP_SELECTOR, timeout=0.3):
+                    break
                 await asyncio.sleep(0.5)
                 elapsed += 0.5
-                
-            # Стриминг
+
             elapsed = 0.0
+            last_text = ""
             while elapsed < GENERATION_TIMEOUT:
                 if int(elapsed * 10) % 30 == 0:
-                    await self._scroll_to_bottom()
-                current_text = ""
-                try:
-                    current_text = await self.page.evaluate("""
-                        (() => {
-                            const msgs = document.querySelectorAll('div[data-message-author-role="assistant"]');
-                            if (msgs.length === 0) return '';
-                            return msgs[msgs.length - 1].innerText;
-                        })()
-                    """)
-                except Exception:
-                    pass
-                
+                    await scroll_bottom(self.page)
+                current_text = await read_last_assistant(self.page)
                 if current_text and current_text != last_text:
-                    new_chunk = current_text[len(last_text):]
+                    i = 0
+                    n = min(len(last_text), len(current_text))
+                    while i < n and last_text[i] == current_text[i]:
+                        i += 1
+                    chunk = current_text[i:]
                     last_text = current_text
-                    yield new_chunk
-                    
-                stop_present = False
-                try:
-                    stop_el = await self.page.select('button[aria-label="Stop generating"], button[data-testid="stop-button"]', timeout=0.2)
-                    if stop_el: stop_present = True
-                except Exception:
-                    pass
-                    
+                    if chunk:
+                        yield chunk
+
+                stop_present = bool(await find_element(self.page, STOP_SELECTOR, timeout=0.2))
                 if not stop_present:
-                    try:
-                        send_el = await self.page.select('[data-testid="send-button"], button[data-testid="composer-send-button"]', timeout=0.2)
-                    except Exception:
-                        send_el = None
-
+                    send_el = await find_element(self.page, SEND_SELECTOR, timeout=0.2)
                     if send_el or elapsed > 5:
-                        logger.info("Генерация завершена успешно.")
+                        logger.info("Генерация завершена.")
                         break
-
                 await asyncio.sleep(0.3)
                 elapsed += 0.3
 
-            # Детектор файлов: клик по кнопкам скачивания в последнем сообщении
-            await self._scroll_to_bottom()
+            await scroll_bottom(self.page)
             await asyncio.sleep(0.5)
-            try:
-                await self.page.evaluate("""
-                    (() => {
-                        const msgs = document.querySelectorAll('div[data-message-author-role="assistant"]');
-                        if (!msgs.length) return;
-                        const last = msgs[msgs.length - 1];
-                        last.querySelectorAll('button, a').forEach(el => {
-                            const t = (el.innerText || '').toLowerCase();
-                            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-                            if (el.classList.contains('behavior-btn') || t.includes('скачать') ||
-                                t.includes('download') || aria.includes('download') || el.hasAttribute('download')) {
-                                try { el.click(); } catch(e){}
-                            }
-                        });
-                    })()
-                """)
-            except Exception:
-                pass
+            await click_download_buttons(self.page)
             await asyncio.sleep(2.0)
+            blob = await collect_files(self.page)
+            if blob:
+                yield blob
 
-            # Сборщик файлов: дописываем скачанные файлы / Canvas в ответ
-            file_blob = await self._collect_files()
-            if file_blob:
-                yield file_blob
-
-            # Иногда реагируем на поп-ап про personality (человечность)
             await self._handle_personality_popup()

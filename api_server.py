@@ -67,10 +67,60 @@ async def list_models():
         ]
     }
 
+TITLE_MARKERS = (
+    "you are a title generator",
+    "generate a brief title",
+    "generate a title for this conversation",
+    "thread title",
+)
+
+
+def _content_text(content) -> str:
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+    return content or ""
+
+
+def is_title_request(messages: List[ChatMessage]) -> bool:
+    for m in messages:
+        if any(mark in _content_text(m.content).lower() for mark in TITLE_MARKERS):
+            return True
+    return False
+
+
+def make_local_title(messages: List[ChatMessage]) -> str:
+    user_txt = ""
+    for m in messages:
+        if m.role == "user":
+            user_txt = _content_text(m.content)
+    lines = [ln.strip() for ln in user_txt.splitlines() if ln.strip()]
+    base = lines[-1] if lines else "Беседа"
+    title = " ".join(base.split()[:6])[:50].strip() or "Беседа"
+    return title[:1].upper() + title[1:]
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     target_model = "Thinking" if "thinking" in request.model.lower() else "Instant"
-    
+
+    # Запрос генерации заголовка от клиента — отвечаем локально, БЕЗ браузера/чата
+    if is_title_request(request.messages):
+        title = make_local_title(request.messages)
+        if request.stream:
+            async def title_gen():
+                chunk = {"id": "chatcmpl-title", "object": "chat.completion.chunk", "model": request.model,
+                         "choices": [{"index": 0, "delta": {"content": title}, "finish_reason": None}]}
+                yield f"data: {json.dumps(chunk)}\n\n"
+                done = {"id": "chatcmpl-title", "object": "chat.completion.chunk", "model": request.model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(done)}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(title_gen(), media_type="text/event-stream")
+        return {
+            "id": "chatcmpl-title", "object": "chat.completion", "model": request.model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": title}, "finish_reason": "stop"}],
+        }
+
     is_new_chat, delta_messages, chat_url, row_id = current_state.match(request.messages)
     
     # Склеиваем только дельту! Если is_new_chat, склеится вся история.
