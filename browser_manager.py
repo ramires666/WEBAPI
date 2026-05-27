@@ -228,14 +228,13 @@ class BrowserManager:
             logger.info("Ввод промпта (длина {} символов)...", len(prompt_text))
             await textarea.click()
             await asyncio.sleep(0.5)
-            # Если текст огромный (это новый чат с историей), вводим быстро через JS, иначе - руками
-            if len(prompt_text) > 2000 and is_new_chat:
-                logger.info("Текст слишком длинный, вставляем через буфер/JS...")
-                await self.page.evaluate(f'''
-                    const ta = document.querySelector("#prompt-textarea");
-                    ta.value = `{prompt_text.replace("`", "\\`")}`;
-                    ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                ''')
+            # ChatGPT composer = contenteditable div (ProseMirror), .value не работает.
+            # Длинный текст вставляем через CDP Input.insertText, короткий — посимвольно.
+            if len(prompt_text) > 2000:
+                logger.info("Длинный текст — вставка через CDP Input.insertText...")
+                await self.page.evaluate("document.querySelector('#prompt-textarea').focus()")
+                await asyncio.sleep(0.2)
+                await self.page.send(cdp_input.insert_text(text=prompt_text))
                 await asyncio.sleep(1)
             else:
                 await human_type(textarea, prompt_text)
@@ -245,7 +244,7 @@ class BrowserManager:
             if send_btn:
                 await send_btn.click()
             else:
-                await textarea.send_keys("\\n")
+                await send_key(self.page, "Enter", 13)
                 
             logger.info("Запрос отправлен. Ждем генерацию...")
             
