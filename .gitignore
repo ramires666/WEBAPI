@@ -3,6 +3,9 @@ chrome_work_profile/
 Profile 2/
 Profile_Fixed/
 
+# Инструменты / IDE
+.claude/
+
 # Runtime / временное
 proxy_state.db
 temp_downloads/
