@@ -8,6 +8,7 @@ _HEADER_RE = re.compile(r"<<<(WRITE|EDIT|BASH|READ|GLOB|GREP)([^>]*)>>>")
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 _BLOCK_VERBS = {"WRITE", "EDIT", "BASH"}   # need a closing <<<END>>>
 _END = "<<<END>>>"
+_THINKING_RE = re.compile(r'^(Thinking|Thought for \d+ seconds?)[\.\.\s]*', re.IGNORECASE)
 
 
 class ResponseParser:
@@ -23,11 +24,15 @@ class ResponseParser:
         async for chunk in chunk_stream:
             self.buf += chunk
             for out in self._drain(model, final=False):
-                yield out
+                if out:  # _content() может вернуть "" после стрипа артефактов
+                    yield out
         for out in self._drain(model, final=True):
-            yield out
+            if out:
+                yield out
         if self.buf:
-            yield self._content(self.buf, model)
+            c = self._content(self.buf, model)
+            if c:
+                yield c
             self.buf = ""
 
     def _drain(self, model: str, final: bool):
@@ -81,7 +86,7 @@ class ResponseParser:
             old, new = self._split_old_new(body)
             return self._tool_chunk("edit", {"filePath": attrs.get("path", ""), "oldString": old, "newString": new}, model)
         if verb == "BASH":
-            return self._tool_chunk("bash", {"command": body.strip()}, model)
+            return self._tool_chunk("bash", {"command": self._strip_fence(body.strip())}, model)
         if verb == "READ":
             return self._tool_chunk("read", {"filePath": attrs.get("path", "")}, model)
         if verb == "GLOB":
@@ -114,6 +119,14 @@ class ResponseParser:
         return self._strip_fence(body), ""
 
     def _content(self, content: str, model: str) -> str:
+        # Стрип артефактов рендера, просочившихся через DOM
+        content = _THINKING_RE.sub('', content)
+        # Canvas: обрезаем от маркера до конца чанка
+        ci = content.find("[Canvas]")
+        if ci != -1:
+            content = content[:ci]
+        if not content.strip():
+            return ""  # Не отправляем пустые чанки
         data = {
             "id": "chatcmpl-proxy",
             "object": "chat.completion.chunk",

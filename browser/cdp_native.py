@@ -114,7 +114,14 @@ def html_to_text(html: str) -> str:
 
 async def read_last_assistant(page) -> str:
     """Текст последнего сообщения ассистента. Чтение через evaluate (быстро;
-    страница не видит CDP-чтения). Весь ВВОД остаётся нативным."""
+    страница не видит CDP-чтения). Весь ВВОД остаётся нативным.
+
+    Фильтрация:
+    - Пропускает DETAILS/SUMMARY элементы (Thinking-индикатор ChatGPT)
+    - Пропускает BUTTON элементы (кнопки интерфейса)
+    - Стрипает [Canvas] маркер и весь хвост после него
+    - Стрипает битые цитатные якоря *]()
+    """
     js_code = '''
     (() => {
         const m = document.querySelectorAll('div[data-message-author-role="assistant"]');
@@ -125,6 +132,14 @@ async def read_last_assistant(page) -> str:
         
         let result = "";
         for (let node of md.childNodes) {
+            // Пропускаем Thinking-блоки (DETAILS/SUMMARY) и кнопки
+            if (node.nodeType === 1) {
+                const tag = node.tagName;
+                if (tag === 'DETAILS' || tag === 'SUMMARY' || tag === 'BUTTON') continue;
+                // Пропускаем div-ы с классами связанными с thinking
+                if (tag === 'DIV' && node.className && 
+                    (node.className.includes('thinking') || node.className.includes('thought'))) continue;
+            }
             if (node.nodeType === 1 && node.tagName === 'PRE') {
                 const codeEl = node.querySelector('code');
                 const code = (codeEl ? codeEl.innerText : node.innerText) || node.textContent || "";
@@ -139,9 +154,15 @@ async def read_last_assistant(page) -> str:
     '''
     try:
         txt = await page.evaluate(js_code) or ""
-        txt = txt.replace("[Canvas]", "")
-        txt = re.sub(r"\*\]\(\)", "", txt)          # битый цитатный якорь ChatGPT
-        txt = re.sub(r"\n{3,}", "\n\n", txt)        # схлопнуть пустые строки от вырезанного
-        return txt
+        # Стрип Canvas — обрезаем ВСЁ от маркера [Canvas] до конца
+        # (после маркера обычно идёт дубль кода в ```-фенсе)
+        canvas_idx = txt.find("[Canvas]")
+        if canvas_idx != -1:
+            txt = txt[:canvas_idx]
+        # Стрип Thinking-префикса (если просочился через DOM)
+        txt = re.sub(r'^(Thinking|Thought for \d+ seconds?)[\.\s]*', '', txt, flags=re.IGNORECASE)
+        txt = re.sub(r'\*\]\(\)', '', txt)          # битый цитатный якорь ChatGPT
+        txt = re.sub(r'\n{3,}', '\n\n', txt)        # схлопнуть пустые строки от вырезанного
+        return txt.strip()
     except Exception:
         return ""
