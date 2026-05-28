@@ -7,11 +7,11 @@ import os
 import time
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-from browser.browser_manager import BrowserManager
+from browser.browser_pool import BrowserPool
 from proxy.conversation_store import ConversationStore, client_fingerprint
 from proxy.token_counter import estimate_messages_tokens
 from proxy.context_summarizer import build_summary_prompt, save_summary, build_context_injection
-from config import AUTO_SUMMARY_ENABLED, TOKEN_LIMIT
+from config import AUTO_SUMMARY_ENABLED, TOKEN_LIMIT, PROFILES, PROFILES_DIR, WORK_DIR
 from loguru import logger
 
 app = FastAPI(title="ChatGPT API Proxy (Human-Mimic Edition)")
@@ -26,7 +26,7 @@ def dump_request(data: dict):
         dump_path = os.path.join(DUMP_DIR, f"request_dump_{ts}.json")
         with open(dump_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        
+
         total_chars = sum(len(str(m.get("content", ""))) for m in data.get("messages", []))
         tools_chars = len(json.dumps(data.get("tools", []), ensure_ascii=False))
         logger.info(
@@ -39,7 +39,8 @@ def dump_request(data: dict):
         )
     except Exception as e:
         logger.warning("Dump failed: {}", e)
-browser_manager = BrowserManager()
+
+browser_pool = BrowserPool(PROFILES, PROFILES_DIR, WORK_DIR)
 
 class ChatMessage(BaseModel):
     role: str
@@ -84,11 +85,11 @@ def format_delta_prompt(delta_messages: List[ChatMessage], tools: Optional[List[
 
 @app.on_event("startup")
 async def startup_event():
-    await browser_manager.start_browser()
+    await browser_pool.start_all()
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    await browser_manager.stop_browser()
+    await browser_pool.stop_all()
 
 @app.get("/v1/models")
 async def list_models():
@@ -157,7 +158,16 @@ async def chat_completions(request: ChatCompletionRequest):
             "choices": [{"index": 0, "message": {"role": "assistant", "content": title}, "finish_reason": "stop"}],
         }
 
-    is_new_chat, delta_messages, chat_url, row_id = current_state.match(request.messages)
+    is_new_chat, delta_messages, chat_url, row_id, browser_id = current_state.match(request.messages)
+
+    # --- Выбор браузера ---
+    manager = browser_pool.get(browser_id) if not is_new_chat else None
+    if manager is None:
+        browser_id, manager = browser_pool.next_for_new_chat()
+        if not is_new_chat:
+            is_new_chat = True
+            chat_url = None
+            row_id = None
 
     # --- Подсчёт токенов и авто-саммари ---
     token_count = estimate_messages_tokens(request.messages)
@@ -169,7 +179,7 @@ async def chat_completions(request: ChatCompletionRequest):
         try:
             summary_prompt = build_summary_prompt()
             summary_text = ""
-            async for chunk in browser_manager.send_prompt_and_stream(
+            async for chunk in manager.send_prompt_and_stream(
                 summary_prompt, target_model, False, chat_url
             ):
                 summary_text += chunk
@@ -177,6 +187,7 @@ async def chat_completions(request: ChatCompletionRequest):
             summary_path = save_summary(summary_text, cid)
             logger.info("📋 Саммари готово ({}), переключаемся на новый чат", summary_path)
             # Переключаемся на новый чат
+            browser_id, manager = browser_pool.next_for_new_chat()
             is_new_chat = True
             chat_url = None
             row_id = None
@@ -205,15 +216,15 @@ async def chat_completions(request: ChatCompletionRequest):
     prompt_text = format_delta_prompt(delta_messages, request.tools, is_new_chat)
     if context_prefix:
         prompt_text = context_prefix + prompt_text
-    
+
     if request.stream:
         from proxy.response_parser import ResponseParser
         async def event_generator():
             full_reply = ""
             try:
-                # В browser_manager передаем флаг is_new_chat, чтобы он нажал кнопку если надо
-                chunk_stream = browser_manager.send_prompt_and_stream(prompt_text, target_model, is_new_chat, chat_url)
-                
+                # Используем выбранный браузер
+                chunk_stream = manager.send_prompt_and_stream(prompt_text, target_model, is_new_chat, chat_url)
+
                 # Мы всё равно сохраним полный ответ для истории
                 parser = ResponseParser()
                 async for chunk_data in parser.process_stream(chunk_stream, request.model):
@@ -232,11 +243,11 @@ async def chat_completions(request: ChatCompletionRequest):
                             full_reply += f'\n```json\n{{"tool_call": {{"name": "{func["name"]}", "arguments": {func["arguments"]}}}}}\n```\n'
                     except:
                         pass
-                        
+
                     yield chunk_data
-                    
-                _url = await browser_manager.get_current_url()
-                current_state.upsert(row_id, request.messages, full_reply, _url, token_count)
+
+                _url = await manager.get_current_url()
+                current_state.upsert(row_id, request.messages, full_reply, _url, token_count, browser_id=browser_id)
 
                 final_data = {
                     "id": "chatcmpl-proxy",
@@ -248,15 +259,15 @@ async def chat_completions(request: ChatCompletionRequest):
                 yield "data: [DONE]\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
-                
+
         return StreamingResponse(event_generator(), media_type="text/event-stream")
     else:
         full_text = ""
-        async for chunk in browser_manager.send_prompt_and_stream(prompt_text, target_model, is_new_chat, chat_url):
+        async for chunk in manager.send_prompt_and_stream(prompt_text, target_model, is_new_chat, chat_url):
             full_text += chunk
 
-        _url = await browser_manager.get_current_url()
-        current_state.upsert(row_id, request.messages, full_text, _url, token_count)
+        _url = await manager.get_current_url()
+        current_state.upsert(row_id, request.messages, full_text, _url, token_count, browser_id=browser_id)
 
         return {
             "id": "chatcmpl-proxy",

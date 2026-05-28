@@ -76,7 +76,8 @@ class ConversationStore:
                     hashes_json TEXT NOT NULL,
                     updated_at REAL NOT NULL,
                     token_count INTEGER DEFAULT 0,
-                    summarized INTEGER DEFAULT 0
+                    summarized INTEGER DEFAULT 0,
+                    browser_id TEXT
                 )
                 """
             )
@@ -86,6 +87,11 @@ class ConversationStore:
                     conn.execute(f"ALTER TABLE conversations ADD COLUMN {col} INTEGER DEFAULT {default}")
                 except sqlite3.OperationalError:
                     pass  # колонка уже существует
+            # Миграция: добавляем browser_id (TEXT)
+            try:
+                conn.execute("ALTER TABLE conversations ADD COLUMN browser_id TEXT")
+            except sqlite3.OperationalError:
+                pass  # колонка уже существует
 
     def _sig_hashes(self, messages) -> List[str]:
         """Подпись диалога: только USER-сообщения. Их клиент шлёт дословно при
@@ -107,8 +113,8 @@ class ConversationStore:
             out.append(hash_message(role, text.strip()))
         return out
 
-    def match(self, messages) -> Tuple[bool, list, Optional[str], Optional[int]]:
-        """(is_new_chat, delta_messages, chat_url, row_id).
+    def match(self, messages) -> Tuple[bool, list, Optional[str], Optional[int], Optional[str]]:
+        """(is_new_chat, delta_messages, chat_url, row_id, browser_id).
 
         Беседа ищется ТОЛЬКО внутри своей IDE (client_id из system) по префиксу
         подписи user/assistant — «привет» из разных IDE не схлопывается."""
@@ -117,19 +123,19 @@ class ConversationStore:
         best = None
         with self._lock, closing(self._conn()) as conn, conn:
             rows = conn.execute(
-                "SELECT id, chat_url, hashes_json FROM conversations WHERE client_id = ?",
+                "SELECT id, chat_url, hashes_json, browser_id FROM conversations WHERE client_id = ?",
                 (cid,),
             ).fetchall()
-        for row_id, chat_url, hashes_json in rows:
+        for row_id, chat_url, hashes_json, browser_id in rows:
             stored = json.loads(hashes_json)
             if not stored or len(stored) > len(incoming):
                 continue
             if incoming[: len(stored)] == stored:
                 if best is None or len(stored) > len(best[1]):
-                    best = (row_id, stored, chat_url)
+                    best = (row_id, stored, chat_url, browser_id)
         if best is None:
-            return True, list(messages), None, None
-        row_id, stored, chat_url = best
+            return True, list(messages), None, None, None
+        row_id, stored, chat_url, browser_id = best
         # delta = непрожёванный хвост: всё ПОСЛЕ последнего ответа ассистента
         # (tool-результаты / новый user). Так продвигается агентский цикл Kilo,
         # а не перечитывается один и тот же экран (иначе бесконечный цикл).
@@ -139,10 +145,10 @@ class ConversationStore:
             if role == "assistant":
                 last_asst = idx
         delta = list(messages[last_asst + 1:])
-        return False, delta, chat_url, row_id
+        return False, delta, chat_url, row_id, browser_id
 
     def upsert(self, row_id: Optional[int], messages, assistant_reply: str,
-               chat_url: Optional[str], token_count: int = 0) -> int:
+               chat_url: Optional[str], token_count: int = 0, browser_id: Optional[str] = None) -> int:
         cid = client_fingerprint(messages)
         hashes = self._sig_hashes(messages)
         payload = json.dumps(hashes)
@@ -150,12 +156,16 @@ class ConversationStore:
         with self._lock, closing(self._conn()) as conn, conn:
             if row_id is None:
                 cur = conn.execute(
-                    "INSERT INTO conversations (client_id, chat_url, hashes_json, updated_at, token_count) VALUES (?, ?, ?, ?, ?)",
-                    (cid, chat_url, payload, now, token_count),
+                    "INSERT INTO conversations (client_id, chat_url, hashes_json, updated_at, token_count, browser_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    (cid, chat_url, payload, now, token_count, browser_id),
                 )
                 return cur.lastrowid
-            conn.execute(
-                "UPDATE conversations SET chat_url=?, hashes_json=?, updated_at=?, token_count=? WHERE id=?",
-                (chat_url, payload, now, token_count, row_id),
-            )
+            update_query = "UPDATE conversations SET chat_url=?, hashes_json=?, updated_at=?, token_count=?"
+            params = [chat_url, payload, now, token_count]
+            if browser_id:
+                update_query += ", browser_id=?"
+                params.append(browser_id)
+            update_query += " WHERE id=?"
+            params.append(row_id)
+            conn.execute(update_query, params)
             return row_id

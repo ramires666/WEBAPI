@@ -16,3 +16,8 @@ AUTO_SUMMARY_ENABLED = os.getenv("AUTO_SUMMARY_ENABLED", "true").lower() == "tru
 TOKEN_LIMIT = int(os.getenv("TOKEN_LIMIT", "200000"))
 SUMMARY_DIR = os.getenv("SUMMARY_DIR", r"W:\_python\APIPROXY\temp\summaries")
 DUMP_MAX_AGE_DAYS = int(os.getenv("DUMP_MAX_AGE_DAYS", "7"))
+
+# Пул профилей
+PROFILES = [p.strip() for p in os.getenv("PROFILES", "Profile 2").split(",") if p.strip()]
+PROFILES_DIR = os.getenv("PROFILES_DIR", r"W:\_python\APIPROXY\profiles")
+WORK_DIR = os.getenv("WORK_DIR", r"W:\_python\APIPROXY\work")
