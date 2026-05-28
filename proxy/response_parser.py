@@ -2,12 +2,12 @@ import json
 import re
 from typing import AsyncGenerator
 
-# Delimiter tool protocol. The model emits raw blocks; we convert to native
+# Delimiter tool protocol (pandoc-style + Russian). The model emits raw blocks; we convert to native
 # OpenAI tool_calls. No JSON escaping required from the model -> far more stable.
-_HEADER_RE = re.compile(r"<<<(WRITE|EDIT|BASH|READ|GLOB|GREP)([^>]*)>>>")
-_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
-_BLOCK_VERBS = {"WRITE", "EDIT", "BASH"}   # need a closing <<<END>>>
-_END = "<<<END>>>"
+# Format: :::verb attr="value":::...:::конец:::
+_HEADER_RE = re.compile(r":::([а-яё]+)\s*([^:]*?):::", re.IGNORECASE | re.UNICODE)
+_ATTR_RE = re.compile(r'([а-яё]+)="([^"]*)"', re.IGNORECASE | re.UNICODE)
+_END = ":::конец:::"
 _THINKING_RE = re.compile(r'^(Thinking|Thought for \d+ seconds?)[\.\.\s]*', re.IGNORECASE)
 
 
@@ -19,6 +19,14 @@ class ResponseParser:
     def _next_id(self) -> str:
         self._n += 1
         return f"call_local_{self._n}"
+
+    def _needs_body(self, verb: str, attrs: dict) -> bool:
+        """True if the block needs a closing :::конец:::"""
+        if verb == "файл" and ("создать" in attrs or "правка" in attrs):
+            return True
+        if verb == "оболочка":
+            return True
+        return False
 
     async def process_stream(self, chunk_stream: AsyncGenerator[str, None], model: str):
         async for chunk in chunk_stream:
@@ -52,7 +60,7 @@ class ResponseParser:
             verb = m.group(1)
             attrs = dict(_ATTR_RE.findall(m.group(2)))
             header_end = m.end()
-            if verb not in _BLOCK_VERBS:
+            if not self._needs_body(verb, attrs):
                 out.append(self._tool(verb, attrs, "", model))
                 self.buf = self.buf[header_end:]
                 continue
@@ -71,30 +79,33 @@ class ResponseParser:
         """How many chars are safe to emit as text now (hold a possible partial marker)."""
         if final:
             return len(s)
-        for tail in ("<<<", "<<", "<"):
+        # Hold partial ::: markers (1-3 colons)
+        for tail in (":::", "::", ":"):
             if s.endswith(tail):
                 return len(s) - len(tail)
-        idx = s.rfind("<<<")
-        if idx != -1 and ">>>" not in s[idx:]:
+        # If there's a ::: without a closing pair, hold from that point
+        idx = s.rfind(":::")
+        if idx != -1 and ":::" not in s[idx + 3:]:
             return idx
         return len(s)
 
     def _tool(self, verb: str, attrs: dict, body: str, model: str) -> str:
-        if verb == "WRITE":
-            return self._tool_chunk("write", {"filePath": attrs.get("path", ""), "content": self._strip_fence(body)}, model)
-        if verb == "EDIT":
-            old, new = self._split_old_new(body)
-            return self._tool_chunk("edit", {"filePath": attrs.get("path", ""), "oldString": old, "newString": new}, model)
-        if verb == "BASH":
+        if verb == "файл":
+            if "создать" in attrs:
+                return self._tool_chunk("write", {"filePath": attrs["создать"], "content": self._strip_fence(body)}, model)
+            if "правка" in attrs:
+                old, new = self._split_old_new(body)
+                return self._tool_chunk("edit", {"filePath": attrs["правка"], "oldString": old, "newString": new}, model)
+            if "читать" in attrs:
+                return self._tool_chunk("read", {"filePath": attrs["читать"]}, model)
+        if verb == "оболочка":
             return self._tool_chunk("bash", {"command": self._strip_fence(body.strip())}, model)
-        if verb == "READ":
-            return self._tool_chunk("read", {"filePath": attrs.get("path", "")}, model)
-        if verb == "GLOB":
-            return self._tool_chunk("glob", {"pattern": attrs.get("pattern", "")}, model)
-        if verb == "GREP":
-            args = {"pattern": attrs.get("pattern", "")}
-            if attrs.get("path"):
-                args["path"] = attrs["path"]
+        if verb == "файлы":
+            return self._tool_chunk("glob", {"pattern": attrs.get("шаблон", "")}, model)
+        if verb == "текст":
+            args = {"pattern": attrs.get("поиск", "")}
+            if attrs.get("в"):
+                args["path"] = attrs["в"]
             return self._tool_chunk("grep", args, model)
         return self._content(body, model)
 
@@ -110,11 +121,11 @@ class ResponseParser:
         return "\n".join(lines)
 
     def _split_old_new(self, body: str):
-        o = body.find("<<<OLD>>>")
-        n = body.find("<<<NEW>>>")
+        o = body.find(":::было:::")
+        n = body.find(":::стало:::")
         if o != -1 and n != -1 and n > o:
-            old = self._strip_fence(body[o + len("<<<OLD>>>"):n])
-            new = self._strip_fence(body[n + len("<<<NEW>>>"):])
+            old = self._strip_fence(body[o + len(":::было:::"):n])
+            new = self._strip_fence(body[n + len(":::стало:::"):])
             return old, new
         return self._strip_fence(body), ""
 

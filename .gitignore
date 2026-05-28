@@ -1,6 +1,7 @@
 # Chrome профили — приватные куки/логин, НЕ коммитить
 chrome_work_profile/
 profiles/
+work/
 # Legacy (на случай если кто-то восстановит из старого бэкапа)
 Profile 2/
 Profile 4/
