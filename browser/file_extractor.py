@@ -3,7 +3,7 @@ import os
 from loguru import logger
 
 from config import TEMP_DOWNLOADS
-from cdp_native import click_element, html_to_text
+from browser.cdp_native import click_element, html_to_text
 
 
 async def click_download_buttons(page) -> int:

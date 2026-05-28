@@ -72,6 +72,18 @@ async def scroll_bottom(page) -> None:
         pass
 
 
+async def human_scroll(page) -> None:
+    """Человекоподобный скролл при ожидании ответа: переменная величина,
+    изредка небольшой откат вверх. Нативный CDP-жест, без JS."""
+    try:
+        if random.random() < 0.18:
+            await page.scroll_up(random.randint(20, 60))
+        else:
+            await page.scroll_down(random.randint(40, 130))
+    except Exception:
+        pass
+
+
 def current_url(page) -> str:
     """URL вкладки из CDP target info (без JS)."""
     try:
@@ -103,12 +115,33 @@ def html_to_text(html: str) -> str:
 async def read_last_assistant(page) -> str:
     """Текст последнего сообщения ассистента. Чтение через evaluate (быстро;
     страница не видит CDP-чтения). Весь ВВОД остаётся нативным."""
+    js_code = '''
+    (() => {
+        const m = document.querySelectorAll('div[data-message-author-role="assistant"]');
+        if (!m.length) return "";
+        const last = m[m.length-1];
+        const md = last.querySelector(".markdown");
+        if (!md) return last.innerText || "";
+        
+        let result = "";
+        for (let node of md.childNodes) {
+            if (node.nodeType === 1 && node.tagName === 'PRE') {
+                const codeEl = node.querySelector('code');
+                const code = (codeEl ? codeEl.innerText : node.innerText) || node.textContent || "";
+                result += code + "\\n";
+            } else {
+                const t = (node.nodeType === 3 ? node.textContent : (node.innerText || node.textContent)) || "";
+                if (t) result += t + "\\n";
+            }
+        }
+        return result.trim();
+    })()
+    '''
     try:
-        txt = await page.evaluate(
-            '(() => { const m = document.querySelectorAll(\'div[data-message-author-role="assistant"]\');'
-            ' if (!m.length) return ""; const last = m[m.length-1];'
-            ' const md = last.querySelector(".markdown"); return (md || last).innerText || ""; })()'
-        )
-        return txt or ""
+        txt = await page.evaluate(js_code) or ""
+        txt = txt.replace("[Canvas]", "")
+        txt = re.sub(r"\*\]\(\)", "", txt)          # битый цитатный якорь ChatGPT
+        txt = re.sub(r"\n{3,}", "\n\n", txt)        # схлопнуть пустые строки от вырезанного
+        return txt
     except Exception:
         return ""

@@ -13,11 +13,11 @@ from config import (
     ORIGINAL_CHROME_USER_DATA, WORKING_PROFILE_DIR, CHROME_PROFILE_NAME,
     CHATGPT_URL, GENERATION_TIMEOUT, TEMP_DOWNLOADS,
 )
-from cdp_native import (
+from browser.cdp_native import (
     send_key, human_type, insert_text_fast, click_element, find_element,
-    scroll_bottom, current_url, read_last_assistant,
+    scroll_bottom, human_scroll, current_url, read_last_assistant,
 )
-from file_extractor import click_download_buttons, collect_files
+from browser.file_extractor import click_download_buttons, collect_files
 
 warnings.filterwarnings('ignore', category=ResourceWarning)
 
@@ -70,39 +70,51 @@ class BrowserManager:
         return current_url(self.page)
 
     async def select_model(self, target_model: str):
-        """Выбор модели реальной мышью. Instant — дефолт, выбор не нужен."""
-        if "instant" in target_model.lower():
-            logger.info("Модель Instant (по умолчанию) — выбор пропущен")
-            return
+        """Переключение модели реальным кликом. Кнопка-переключатель ChatGPT —
+        это button[aria-haspopup="menu"], чей текст = текущая модель
+        (Instant/Thinking/Auto). Переключаем только если текущая != целевая —
+        работает в обе стороны (в т.ч. Thinking->Instant)."""
+        target = target_model.strip().lower()
+        MODEL_NAMES = ("instant", "thinking", "auto")
         try:
             buttons = await self.page.select_all("button")
         except Exception:
             buttons = []
         selector_btn = None
+        current = ""
         for b in buttons or []:
             try:
-                t = (b.text_all or "").lower()
-                if b.attrs.get("data-testid") == "send-button":
+                if b.attrs.get("aria-haspopup") != "menu":
                     continue
-                if "project" in t:
-                    continue
-                if any(k in t for k in MODEL_KEYWORDS):
+                t = (b.text_all or "").strip().lower()
+                if t in MODEL_NAMES:
                     selector_btn = b
+                    current = t
                     break
             except Exception:
                 continue
-        if not selector_btn or not await click_element(selector_btn):
+        if not selector_btn:
             logger.warning("Кнопка выбора модели не найдена")
+            return
+        if current == target:
+            logger.info("Модель уже '{}' — переключение не нужно", target_model)
+            return
+        if not await click_element(selector_btn):
+            logger.warning("Не удалось кликнуть переключатель модели")
             return
         await asyncio.sleep(1.2)
         try:
-            items = await self.page.select_all('[role="menuitem"], [role="option"]')
+            items = await self.page.select_all(
+                '[role="menuitem"], [role="menuitemradio"], [role="option"]'
+            )
         except Exception:
             items = []
+        logger.info("МЕНЮ МОДЕЛЕЙ ({}): {}", len(items or []),
+                    [(it.text_all or "").strip()[:50] for it in (items or [])])
         for it in items or []:
             try:
-                t = (it.text_all or "").lower()
-                if target_model.lower() in t and "project" not in t:
+                t = (it.text_all or "").strip().lower()
+                if t == target or (target in t and "project" not in t):
                     await click_element(it)
                     await asyncio.sleep(1.0)
                     logger.info("Модель выбрана: {}", target_model)
@@ -131,13 +143,20 @@ class BrowserManager:
                 logger.info("=== НАЧАЛО НОВОГО ЧАТА ===")
                 await self.page.get(CHATGPT_URL)
                 await asyncio.sleep(3.5)
-                await self.select_model(target_model)
             elif chat_url:
-                logger.info("=== ПЕРЕХОД В ЧАТ {} ===", chat_url)
-                await self.page.get(chat_url)
-                await asyncio.sleep(3.0)
+                current_url = await self.get_current_url()
+                if current_url.rstrip("/") != chat_url.rstrip("/"):
+                    logger.info("=== ПЕРЕХОД В ЧАТ {} ===", chat_url)
+                    await self.page.get(chat_url)
+                    await asyncio.sleep(3.0)
+                else:
+                    logger.info("=== ЧАТ {} УЖЕ ОТКРЫТ ===", chat_url)
             else:
                 logger.info("=== ПРОДОЛЖЕНИЕ ТЕКУЩЕГО ЧАТА ===")
+
+            # Модель применяем перед КАЖДЫМ сообщением (её можно менять в любой
+            # момент диалога), а не только в новом чате. Для Instant — no-op.
+            await self.select_model(target_model)
 
             textarea = await find_element(self.page, COMPOSER_SELECTOR, timeout=10)
             if not textarea:
@@ -165,7 +184,19 @@ class BrowserManager:
             last_change = start
             last_scroll = start
             seen_activity = False
-            last_text = await read_last_assistant(self.page)  # базовый текст (для продолжения чата)
+            baseline = await read_last_assistant(self.page)  # текст ДО ответа (для продолжения чата)
+            last_text = baseline
+            prev_text = baseline
+            emitted = ""        # часть НОВОГО ответа, уже отданная клиенту
+            started = False     # новый ответ начал появляться
+
+            def _cpl(a, b):
+                n = min(len(a), len(b))
+                i = 0
+                while i < n and a[i] == b[i]:
+                    i += 1
+                return i
+
             while time.time() - start < GENERATION_TIMEOUT:
                 stop_present = False
                 try:
@@ -177,35 +208,57 @@ class BrowserManager:
 
                 current_text = await read_last_assistant(self.page)
                 if current_text != last_text:
-                    i = 0
-                    n = min(len(last_text), len(current_text))
-                    while i < n and last_text[i] == current_text[i]:
-                        i += 1
-                    chunk = current_text[i:]
                     last_text = current_text
-                    if chunk:
-                        yield chunk
                     seen_activity = True
                     last_change = time.time()
+
+                # новый ответ начался (отличается от того, что было до отправки)
+                if not started and current_text and current_text != baseline:
+                    started = True
+                    prev_text = current_text
+
+                # Стабильный стриминг: отдаём только префикс, совпавший в ДВУХ
+                # подряд чтениях DOM (исключает искажения от ре-рендеров), и только
+                # как чистое продолжение уже отданного.
+                if started:
+                    sp = _cpl(prev_text, current_text)
+                    prev_text = current_text
+                    if sp > len(emitted) and current_text[:len(emitted)] == emitted:
+                        chunk = current_text[len(emitted):sp]
+                        emitted = current_text[:sp]
+                        if chunk:
+                            yield chunk
 
                 if stop_present:
                     seen_activity = True
                     last_change = time.time()
 
-                # завершено: есть непустой текст ответа, Stop исчез, текст стабилен ~2с
-                if last_text and not stop_present and (time.time() - last_change) >= 2.0:
+                # завершено: новый непустой текст, Stop исчез, текст стабилен ~2с
+                if last_text and last_text != baseline and not stop_present and (time.time() - last_change) >= 2.0:
                     logger.info("Генерация завершена.")
+                    with open("temp/final_generation_dump.txt", "w", encoding="utf-8") as f:
+                        f.write(last_text)
                     break
                 # ответ так и не появился — не висим
-                if not last_text and (time.time() - start) > 25:
+                if (not last_text or last_text == baseline) and (time.time() - start) > 25:
                     logger.warning("Ответ не появился за 25с — выходим.")
                     break
 
-                if time.time() - last_scroll >= 3.0:
-                    await scroll_bottom(self.page)
+                if time.time() - last_scroll >= random.uniform(1.5, 3.5):
+                    await human_scroll(self.page)
                     last_scroll = time.time()
                 await asyncio.sleep(interval)
 
+            # Досыл хвоста: гарантируем, что отдан ПОЛНЫЙ чистый финальный текст
+            # (всё, что не успели отдать стабильным стримингом).
+            final_text = last_text if last_text != baseline else ""
+            if final_text:
+                if final_text.startswith(emitted):
+                    tail = final_text[len(emitted):]
+                else:
+                    tail = final_text[_cpl(emitted, final_text):]
+                if tail:
+                    yield tail
             await scroll_bottom(self.page)
             await asyncio.sleep(0.5)
             await click_download_buttons(self.page)

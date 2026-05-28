@@ -80,13 +80,23 @@ class ConversationStore:
             )
 
     def _sig_hashes(self, messages) -> List[str]:
-        """Подпись диалога: только user/assistant (system/tools волатильны)."""
+        """Подпись диалога: только USER-сообщения. Их клиент шлёт дословно при
+        продолжении; ответы ассистента клиенты нормализуют/обрезают -> ненадёжны."""
         out = []
         for m in messages:
             role = m.role if hasattr(m, "role") else m["role"]
-            if role not in ("user", "assistant"):
+            if role != "user":
                 continue
-            out.append(hash_message(role, m.content if hasattr(m, "content") else m["content"]))
+            
+            # Извлекаем текст
+            content = m.content if hasattr(m, "content") else m["content"]
+            text = _text(content)
+            
+            # Kilo Code добавляет <environment_details> к последнему сообщению,
+            # но удаляет его из старых сообщений. Нужно вырезать этот блок перед хешированием.
+            text = re.sub(r'<environment_details>.*?</environment_details>', '', text, flags=re.DOTALL)
+            
+            out.append(hash_message(role, text.strip()))
         return out
 
     def match(self, messages) -> Tuple[bool, list, Optional[str], Optional[int]]:
@@ -112,16 +122,21 @@ class ConversationStore:
         if best is None:
             return True, list(messages), None, None
         row_id, stored, chat_url = best
-        ua = [m for m in messages
-              if (m.role if hasattr(m, "role") else m["role"]) in ("user", "assistant")]
-        delta = ua[len(stored):]
+        # delta = непрожёванный хвост: всё ПОСЛЕ последнего ответа ассистента
+        # (tool-результаты / новый user). Так продвигается агентский цикл Kilo,
+        # а не перечитывается один и тот же экран (иначе бесконечный цикл).
+        last_asst = -1
+        for idx, m in enumerate(messages):
+            role = m.role if hasattr(m, "role") else m["role"]
+            if role == "assistant":
+                last_asst = idx
+        delta = list(messages[last_asst + 1:])
         return False, delta, chat_url, row_id
 
     def upsert(self, row_id: Optional[int], messages, assistant_reply: str,
                chat_url: Optional[str]) -> int:
         cid = client_fingerprint(messages)
         hashes = self._sig_hashes(messages)
-        hashes.append(hash_message("assistant", assistant_reply))
         payload = json.dumps(hashes)
         now = time.time()
         with self._lock, closing(self._conn()) as conn, conn:
