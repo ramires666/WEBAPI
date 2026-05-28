@@ -74,10 +74,18 @@ class ConversationStore:
                     client_id TEXT NOT NULL,
                     chat_url TEXT,
                     hashes_json TEXT NOT NULL,
-                    updated_at REAL NOT NULL
+                    updated_at REAL NOT NULL,
+                    token_count INTEGER DEFAULT 0,
+                    summarized INTEGER DEFAULT 0
                 )
                 """
             )
+            # Миграция: добавляем новые колонки к существующей БД
+            for col, default in [("token_count", "0"), ("summarized", "0")]:
+                try:
+                    conn.execute(f"ALTER TABLE conversations ADD COLUMN {col} INTEGER DEFAULT {default}")
+                except sqlite3.OperationalError:
+                    pass  # колонка уже существует
 
     def _sig_hashes(self, messages) -> List[str]:
         """Подпись диалога: только USER-сообщения. Их клиент шлёт дословно при
@@ -134,7 +142,7 @@ class ConversationStore:
         return False, delta, chat_url, row_id
 
     def upsert(self, row_id: Optional[int], messages, assistant_reply: str,
-               chat_url: Optional[str]) -> int:
+               chat_url: Optional[str], token_count: int = 0) -> int:
         cid = client_fingerprint(messages)
         hashes = self._sig_hashes(messages)
         payload = json.dumps(hashes)
@@ -142,12 +150,12 @@ class ConversationStore:
         with self._lock, closing(self._conn()) as conn, conn:
             if row_id is None:
                 cur = conn.execute(
-                    "INSERT INTO conversations (client_id, chat_url, hashes_json, updated_at) VALUES (?, ?, ?, ?)",
-                    (cid, chat_url, payload, now),
+                    "INSERT INTO conversations (client_id, chat_url, hashes_json, updated_at, token_count) VALUES (?, ?, ?, ?, ?)",
+                    (cid, chat_url, payload, now, token_count),
                 )
                 return cur.lastrowid
             conn.execute(
-                "UPDATE conversations SET chat_url=?, hashes_json=?, updated_at=? WHERE id=?",
-                (chat_url, payload, now, row_id),
+                "UPDATE conversations SET chat_url=?, hashes_json=?, updated_at=?, token_count=? WHERE id=?",
+                (chat_url, payload, now, token_count, row_id),
             )
             return row_id

@@ -8,7 +8,10 @@ import time
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from browser.browser_manager import BrowserManager
-from proxy.conversation_store import ConversationStore
+from proxy.conversation_store import ConversationStore, client_fingerprint
+from proxy.token_counter import estimate_messages_tokens
+from proxy.context_summarizer import build_summary_prompt, save_summary, build_context_injection
+from config import AUTO_SUMMARY_ENABLED, TOKEN_LIMIT
 from loguru import logger
 
 app = FastAPI(title="ChatGPT API Proxy (Human-Mimic Edition)")
@@ -156,6 +159,34 @@ async def chat_completions(request: ChatCompletionRequest):
 
     is_new_chat, delta_messages, chat_url, row_id = current_state.match(request.messages)
 
+    # --- Подсчёт токенов и авто-саммари ---
+    token_count = estimate_messages_tokens(request.messages)
+    logger.info("📊 Токенов в запросе: ~{} (лимит: {})", token_count, TOKEN_LIMIT)
+
+    if AUTO_SUMMARY_ENABLED and token_count > TOKEN_LIMIT and not is_new_chat:
+        logger.warning("⚠️ Превышен лимит токенов ({} > {}). Генерируем саммари...",
+                       token_count, TOKEN_LIMIT)
+        try:
+            summary_prompt = build_summary_prompt()
+            summary_text = ""
+            async for chunk in browser_manager.send_prompt_and_stream(
+                summary_prompt, target_model, False, chat_url
+            ):
+                summary_text += chunk
+            cid = client_fingerprint(request.messages)
+            summary_path = save_summary(summary_text, cid)
+            logger.info("📋 Саммари готово ({}), переключаемся на новый чат", summary_path)
+            # Переключаемся на новый чат
+            is_new_chat = True
+            chat_url = None
+            row_id = None
+            context_prefix = build_context_injection(summary_text)
+        except Exception as e:
+            logger.error("❌ Ошибка генерации саммари: {}. Продолжаем без саммари.", e)
+            context_prefix = ""
+    else:
+        context_prefix = ""
+
     # Нечего отправлять (история заканчивается нашим же ответом) — не трогаем
     # браузер и сразу завершаем, чтобы не зациклить агента на перечитывании экрана.
     if not is_new_chat and not delta_messages:
@@ -172,6 +203,8 @@ async def chat_completions(request: ChatCompletionRequest):
 
     # Склеиваем только дельту! Если is_new_chat, склеится вся история.
     prompt_text = format_delta_prompt(delta_messages, request.tools, is_new_chat)
+    if context_prefix:
+        prompt_text = context_prefix + prompt_text
     
     if request.stream:
         from proxy.response_parser import ResponseParser
@@ -203,7 +236,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     yield chunk_data
                     
                 _url = await browser_manager.get_current_url()
-                current_state.upsert(row_id, request.messages, full_reply, _url)
+                current_state.upsert(row_id, request.messages, full_reply, _url, token_count)
 
                 final_data = {
                     "id": "chatcmpl-proxy",
@@ -223,7 +256,7 @@ async def chat_completions(request: ChatCompletionRequest):
             full_text += chunk
 
         _url = await browser_manager.get_current_url()
-        current_state.upsert(row_id, request.messages, full_text, _url)
+        current_state.upsert(row_id, request.messages, full_text, _url, token_count)
 
         return {
             "id": "chatcmpl-proxy",
