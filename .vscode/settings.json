@@ -1,0 +1,27 @@
+{
+  "// Описание": "Эти исключения снимают нагрузку с VSCode на больших папках, которые мы не редактируем (Chrome-профили, runtime-копии, кэши Python). Они уже в .gitignore — здесь же убираем их из file watcher / search / SCM view.",
+  "files.watcherExclude": {
+    "**/profiles/**": true,
+    "**/chrome_work_profile/**": true,
+    "**/work/**": true,
+    "**/temp/**": true,
+    "**/temp_downloads/**": true,
+    "**/__pycache__/**": true,
+    "**/.venv/**": true,
+    "**/Profile 2/**": true,
+    "**/Profile 4/**": true,
+    "**/Profile_Fixed/**": true
+  },
+  "search.exclude": {
+    "**/profiles": true,
+    "**/chrome_work_profile": true,
+    "**/work": true,
+    "**/temp_downloads": true,
+    "**/temp/request_dump_*.json": true,
+    "**/temp/server.log": true,
+    "**/__pycache__": true,
+    "**/.venv": true,
+    "**/*.pyc": true
+  },
+  "git.ignoreLimitWarning": true
+}
