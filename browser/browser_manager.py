@@ -8,6 +8,8 @@ import warnings
 from loguru import logger
 import nodriver as uc
 import nodriver.cdp.browser as cdp_browser
+import nodriver.cdp.emulation as cdp_emulation
+import nodriver.cdp.page as cdp_page
 
 from config import (
     CHATGPT_URL, GENERATION_TIMEOUT, TEMP_DOWNLOADS,
@@ -53,6 +55,19 @@ class BrowserManager:
         self.browser = await uc.start(config)
         self.page = await self.browser.get(CHATGPT_URL)
         await asyncio.sleep(4)
+
+        # Эмуляция фокуса — чтобы ChatGPT не throttle'ил стрим в фоновых вкладках
+        try:
+            await self.page.send(cdp_emulation.set_focus_emulation_enabled(enabled=True))
+            logger.info("[{}] Focus emulation: ON", self.profile_name)
+        except Exception as e:
+            logger.warning("[{}] Focus emulation failed: {}", self.profile_name, e)
+        try:
+            await self.page.send(cdp_page.set_web_lifecycle_state(state="active"))
+            logger.info("[{}] Lifecycle: active", self.profile_name)
+        except Exception as e:
+            logger.warning("[{}] Lifecycle set failed: {}", self.profile_name, e)
+
         os.makedirs(TEMP_DOWNLOADS, exist_ok=True)
         try:
             await self.page.send(cdp_browser.set_download_behavior(behavior="allow", download_path=TEMP_DOWNLOADS))
