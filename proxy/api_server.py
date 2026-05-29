@@ -221,6 +221,8 @@ async def chat_completions(request: ChatCompletionRequest):
         from proxy.response_parser import ResponseParser
         async def event_generator():
             full_reply = ""
+            chunks_yielded = 0
+            tool_call_count = 0
             try:
                 # Используем выбранный браузер
                 chunk_stream = manager.send_prompt_and_stream(prompt_text, target_model, is_new_chat, chat_url)
@@ -239,14 +241,24 @@ async def chat_completions(request: ChatCompletionRequest):
                             full_reply += delta["content"]
                         elif "tool_calls" in delta:
                             # Сохраняем тул колл в историю как текст, чтобы знать, что мы вызывали
+                            tool_call_count += 1
                             func = delta["tool_calls"][0]["function"]
                             full_reply += f'\n```json\n{{"tool_call": {{"name": "{func["name"]}", "arguments": {func["arguments"]}}}}}\n```\n'
                     except:
                         pass
 
+                    chunks_yielded += 1
                     yield chunk_data
 
-                _url = await manager.get_current_url()
+                logger.info("📤 SSE: yielded={} chunks, tool_calls={}", chunks_yielded, tool_call_count)
+                logger.info("🔚 СТАРТ post-stream (get_current_url + upsert)")
+                _t = time.perf_counter()
+                try:
+                    _url = await asyncio.wait_for(manager.get_current_url(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    logger.warning("get_current_url таймаут 3s — используем пустую URL")
+                    _url = ""
+                logger.info("✅ get_current_url: {:.2f}s", time.perf_counter() - _t)
                 current_state.upsert(row_id, request.messages, full_reply, _url, token_count, browser_id=browser_id)
 
                 final_data = {
@@ -257,6 +269,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 }
                 yield f"data: {json.dumps(final_data)}\n\n"
                 yield "data: [DONE]\n\n"
+                logger.info("✅ ЗАВЕРШЕНО SSE [DONE]")
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
 

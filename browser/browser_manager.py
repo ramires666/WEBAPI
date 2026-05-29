@@ -261,6 +261,9 @@ class BrowserManager:
             logger.info("[{}] Запрос отправлен. Ждём генерацию...", self.profile_name)
             interval = 0.4
             start = time.time()
+            t_submit = time.perf_counter()
+            t_first_chunk = None
+            t_done = None
             last_change = start
             last_scroll = start
             last_focus_refresh = start
@@ -309,6 +312,8 @@ class BrowserManager:
                         chunk = current_text[len(emitted):sp]
                         emitted = current_text[:sp]
                         if chunk:
+                            if t_first_chunk is None:
+                                t_first_chunk = time.perf_counter()
                             yield chunk
 
                 if stop_present:
@@ -333,6 +338,7 @@ class BrowserManager:
                         last_change = time.time()
                         seen_activity = True
                         continue
+                    t_done = time.perf_counter()
                     logger.info("[{}] Генерация завершена.", self.profile_name)
                     with open("temp/final_generation_dump.txt", "w", encoding="utf-8") as f:
                         f.write(last_text)
@@ -366,19 +372,49 @@ class BrowserManager:
             # Досыл хвоста: гарантируем, что отдан ПОЛНЫЙ чистый финальный текст
             # (всё, что не успели отдать стабильным стримингом).
             final_text = last_text if last_text != baseline else ""
+            logger.info("[{}] 📝 FINAL_TEXT: len={}, has_write={}, has_end={}, has_edit={}, head={!r}",
+                        self.profile_name, len(final_text),
+                        "<<<WRITE" in final_text, "<<<END>>>" in final_text, "<<<EDIT" in final_text,
+                        final_text[:200])
             if final_text:
                 if final_text.startswith(emitted):
                     tail = final_text[len(emitted):]
                 else:
                     tail = final_text[_cpl(emitted, final_text):]
                 if tail:
+                    logger.info("[{}] 📤 yield tail: len={}", self.profile_name, len(tail))
                     yield tail
+            t_post_start = time.perf_counter()
             await scroll_bottom(self.page)
-            await asyncio.sleep(0.5)
-            await click_download_buttons(self.page)
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(0.3)
+            t_click_start = time.perf_counter()
+            clicked = await click_download_buttons(self.page)
+            logger.info("[{}] ⏱ click_download_buttons: {:.2f}s, clicked={}",
+                        self.profile_name, time.perf_counter() - t_click_start, clicked)
+            if clicked > 0:
+                await asyncio.sleep(2.0)
+            t_collect_start = time.perf_counter()
             blob = await collect_files(self.page)
+            logger.info("[{}] ⏱ collect_files: {:.2f}s, blob_len={}",
+                        self.profile_name, time.perf_counter() - t_collect_start, len(blob or ""))
             if blob:
                 yield blob
 
-            await self._handle_personality_popup()
+            t_popup_start = time.perf_counter()
+            try:
+                await asyncio.wait_for(self._handle_personality_popup(), timeout=1.0)
+            except asyncio.TimeoutError:
+                logger.warning("[{}] _handle_personality_popup таймаут 1s — пропускаем", self.profile_name)
+            logger.info("[{}] ⏱ popup: {:.2f}s", self.profile_name, time.perf_counter() - t_popup_start)
+
+            # Сводка таймингов
+            t_end = time.perf_counter()
+            submit_to_first = (t_first_chunk - t_submit) if t_first_chunk else None
+            gen_time = (t_done - t_submit) if t_done else None
+            post_time = t_end - t_post_start
+            total = t_end - t_submit
+            logger.info("[{}] 📊 ТАЙМИНГ: submit→first={}, gen={}, post={:.2f}s, total={:.2f}s",
+                        self.profile_name,
+                        f"{submit_to_first:.2f}s" if submit_to_first else "N/A",
+                        f"{gen_time:.2f}s" if gen_time else "N/A",
+                        post_time, total)
