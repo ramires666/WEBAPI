@@ -12,7 +12,7 @@ import nodriver.cdp.emulation as cdp_emulation
 import nodriver.cdp.page as cdp_page
 
 from config import (
-    CHATGPT_URL, GENERATION_TIMEOUT, TEMP_DOWNLOADS,
+    CHATGPT_URL, GENERATION_TIMEOUT, TEMP_DOWNLOADS, NO_MINIMIZE_PROFILES,
 )
 from browser.cdp_native import (
     send_key, human_type, insert_text_fast, click_element, find_element,
@@ -73,6 +73,26 @@ class BrowserManager:
         config.add_argument("--disable-renderer-backgrounding")
         self.browser = await uc.start(config)
         self.page = await self.browser.get(CHATGPT_URL)
+
+        # Унести окно за пределы экрана — рендерит DOM, CDP работает, но не видно.
+        # MINIMIZED ломает: пункты меню не рендерятся, ChatGPT select_model/ввод глохнут.
+        # Профили из NO_MINIMIZE_PROFILES остаются на экране (визуальный контроль).
+        if self.profile_name not in NO_MINIMIZE_PROFILES:
+            try:
+                window_id, _ = await self.page.send(cdp_browser.get_window_for_target())
+                await self.page.send(cdp_browser.set_window_bounds(
+                    window_id=window_id,
+                    bounds=cdp_browser.Bounds(
+                        left=-32000, top=-32000, width=1280, height=900,
+                        window_state=cdp_browser.WindowState.NORMAL,
+                    )
+                ))
+                logger.info("[{}] Окно уведено off-screen (-32000,-32000)", self.profile_name)
+            except Exception as e:
+                logger.warning("[{}] Не удалось увести окно off-screen: {}", self.profile_name, e)
+        else:
+            logger.info("[{}] Окно остаётся на экране (в NO_MINIMIZE_PROFILES)", self.profile_name)
+
         await asyncio.sleep(4)
 
         # Эмуляция фокуса — чтобы ChatGPT не throttle'ил стрим в фоновых вкладках
@@ -98,39 +118,153 @@ class BrowserManager:
 
     async def select_model(self, target_model: str):
         """Переключение модели реальным кликом. Кнопка-переключатель ChatGPT —
-        это button[aria-haspopup="menu"], чей текст = текущая модель
-        (Instant/Thinking/Auto). Переключаем только если текущая != целевая —
-        работает в обе стороны (в т.ч. Thinking->Instant)."""
+        обычно button[aria-haspopup="menu"], чей текст содержит модель
+        (Instant/Thinking/Auto). Фоллбэк — поиск по data-testid/aria-label
+        (на некоторых аккаунтах текст кнопки пустой и её можно опознать
+        только по этим атрибутам)."""
         target_low = target_model.strip().lower()
-        try:
-            buttons = await self.page.select_all("button")
-        except Exception:
-            buttons = []
-
-        # Сбор кандидатов с aria-haspopup="menu" — диагностика
-        candidates = []
-        for b in buttons or []:
-            try:
-                if b.attrs.get("aria-haspopup") == "menu":
-                    candidates.append((b, (b.text_all or "").strip()))
-            except Exception:
-                continue
-        logger.info("[{}] КНОПКИ-МЕНЮ aria-haspopup (всего {}): {}",
-                    self.profile_name, len(candidates),
-                    [t[:60] for _, t in candidates])
-
-        # Поиск кнопки-селектора модели: substring-матчинг
+        timeout_sec = 8.0
+        interval_sec = 0.3
+        start_time = time.perf_counter()
         selector_btn = None
         current_raw = ""
-        for b, raw in candidates:
-            tl = raw.lower()
-            if any(k in tl for k in ("instant", "thinking", "auto")) and "project" not in tl and "share" not in tl:
-                selector_btn = b
-                current_raw = raw
+        match_strategy = ""
+        candidates = []
+        attempt_count = 0
+
+        def _attr(b, name):
+            try:
+                v = b.attrs.get(name)
+                return (v or "").lower() if isinstance(v, str) else ""
+            except Exception:
+                return ""
+
+        while time.perf_counter() - start_time < timeout_sec:
+            attempt_count += 1
+            try:
+                buttons = await self.page.select_all("button")
+            except Exception:
+                buttons = []
+
+            candidates = []
+            for b in buttons or []:
+                try:
+                    if b.attrs.get("aria-haspopup") == "menu":
+                        candidates.append((b, (b.text_all or "").strip()))
+                except Exception:
+                    continue
+
+            # Стратегия 1: aria-haspopup="menu" + текст содержит instant/thinking/auto
+            for b, raw in candidates:
+                tl = raw.lower()
+                if any(k in tl for k in ("instant", "thinking", "auto")) and "project" not in tl and "share" not in tl:
+                    selector_btn = b
+                    current_raw = raw
+                    match_strategy = "haspopup+text"
+                    break
+
+            # Стратегия 2: aria-haspopup="menu" + aria-label/data-testid содержит model/модел
+            if not selector_btn:
+                for b, raw in candidates:
+                    al = _attr(b, "aria-label")
+                    tid = _attr(b, "data-testid")
+                    if ("model" in al or "модел" in al or "model" in tid):
+                        selector_btn = b
+                        current_raw = raw or al or tid
+                        match_strategy = f"haspopup+attr(al='{al[:30]}',tid='{tid[:30]}')"
+                        break
+
+            # Стратегия 3: любая кнопка с data-testid*="model-switcher" / aria-label model selector
+            if not selector_btn:
+                try:
+                    extra = await self.page.select_all(
+                        '[data-testid*="model"], [aria-label*="model" i], [aria-label*="Model"]'
+                    )
+                except Exception:
+                    extra = []
+                for b in extra or []:
+                    try:
+                        al = _attr(b, "aria-label")
+                        tid = _attr(b, "data-testid")
+                        if "switcher" in tid or "switch" in al or "select model" in al or "model" == al.strip() or "modell" in al:
+                            selector_btn = b
+                            current_raw = (b.text_all or "").strip() or al or tid
+                            match_strategy = f"attr-only(al='{al[:30]}',tid='{tid[:30]}')"
+                            break
+                        # любой результат селектора, у которого testid начинается с model-
+                        if tid.startswith("model-"):
+                            selector_btn = b
+                            current_raw = (b.text_all or "").strip() or al or tid
+                            match_strategy = f"testid-prefix(tid='{tid[:40]}')"
+                            break
+                    except Exception:
+                        continue
+
+            # Стратегия 4 (Atlas-аккаунты): aria-haspopup="menu" кнопка с текстом-режимом
+            # вроде 'Extended' / 'Standard' (не из чёрного списка sidebar/history/composer).
+            if not selector_btn:
+                BLACKLIST_TEXTS = {"recents", "projects", "search chats", ""}
+                BLACKLIST_AL = ("open conversation", "open sidebar", "close sidebar",
+                                "download apps", "add files", "composer", "send prompt",
+                                "start dictation", "turn on temporary")
+                for b, raw in candidates:
+                    try:
+                        al = _attr(b, "aria-label")
+                        tid = _attr(b, "data-testid")
+                        tlow = raw.lower().strip()
+                        if tlow in BLACKLIST_TEXTS:
+                            continue
+                        if any(bad in al for bad in BLACKLIST_AL):
+                            continue
+                        if "history-item" in tid or "composer-plus" in tid:
+                            continue
+                        # Это режим-кнопка Atlas-UI (Extended и т.п.) — берём её
+                        selector_btn = b
+                        current_raw = raw
+                        match_strategy = f"atlas-mode-btn(raw='{raw[:30]}')"
+                        break
+                    except Exception:
+                        continue
+
+            if selector_btn:
                 break
+
+            await asyncio.sleep(interval_sec)
+
+        logger.info("[{}] КНОПКИ-МЕНЮ aria-haspopup (всего {}, попыток={}, стратегия='{}'): {}",
+                    self.profile_name, len(candidates), attempt_count, match_strategy or "—",
+                    [t[:60] for _, t in candidates])
+
         if not selector_btn:
-            logger.warning("[{}] Кнопка выбора модели не найдена (target='{}'). Кандидаты: {}",
-                           self.profile_name, target_model, [t[:60] for _, t in candidates])
+            # ДИАГНОСТИЧЕСКИЙ ДАМП: что вообще на странице?
+            try:
+                url_now = current_url(self.page)
+            except Exception:
+                url_now = "?"
+            try:
+                title_node = await self.page.evaluate("document.title")
+                page_title = str(title_node)[:120] if title_node else ""
+            except Exception:
+                page_title = "?"
+            # Все кнопки + aria-label первых 30
+            try:
+                all_btns = await self.page.select_all("button")
+            except Exception:
+                all_btns = []
+            btn_dump = []
+            for b in (all_btns or [])[:30]:
+                try:
+                    al = _attr(b, "aria-label")
+                    tid = _attr(b, "data-testid")
+                    hp = _attr(b, "aria-haspopup")
+                    txt = (b.text_all or "").strip()[:30]
+                    btn_dump.append(f"al='{al[:25]}' tid='{tid[:25]}' hp='{hp}' txt='{txt}'")
+                except Exception:
+                    continue
+            logger.warning("[{}] Кнопка выбора модели не найдена (target='{}'). URL='{}', title='{}'. Всего button={}. Дамп первых 30:",
+                           self.profile_name, target_model, url_now, page_title, len(all_btns or []))
+            for i, row in enumerate(btn_dump):
+                logger.warning("[{}]   btn[{}]: {}", self.profile_name, i, row)
             return
         logger.info("[{}] ТЕКУЩАЯ МОДЕЛЬ (raw): '{}' | target: '{}'",
                     self.profile_name, current_raw, target_model)
@@ -161,9 +295,10 @@ class BrowserManager:
             try:
                 t = (it.text_all or "").strip().lower()
                 if target_low in t and "project" not in t:
-                    await click_element(it)
+                    clicked_item_text = (it.text_all or "").strip()
+                    click_ok = await click_element(it)
                     await asyncio.sleep(1.2)
-                    # ВЕРИФИКАЦИЯ: перечитываем кнопку
+                    # ВЕРИФИКАЦИЯ: перечитываем кнопку (включая Atlas-режимы)
                     try:
                         buttons2 = await self.page.select_all("button")
                         verified_raw = ""
@@ -171,7 +306,7 @@ class BrowserManager:
                             try:
                                 if b2.attrs.get("aria-haspopup") == "menu":
                                     txt2 = (b2.text_all or "").strip()
-                                    if any(k in txt2.lower() for k in ("instant", "thinking", "auto")):
+                                    if any(k in txt2.lower() for k in ("instant", "thinking", "auto", "extended", "standard")):
                                         verified_raw = txt2
                                         break
                             except Exception:
@@ -179,9 +314,14 @@ class BrowserManager:
                         if target_low in verified_raw.lower():
                             logger.info("[{}] ✅ ВЕРИФИКАЦИЯ: модель переключена на '{}' (raw='{}')",
                                         self.profile_name, target_model, verified_raw)
+                        elif click_ok and target_low in clicked_item_text.lower():
+                            # Косвенная верификация: клик прошёл по правильному пункту,
+                            # но Atlas-UI не показывает target в тексте кнопки (рендерит 'Extended' и т.п.)
+                            logger.info("[{}] ✅ ВЕРИФИКАЦИЯ (косвенная, Atlas-UI): клик по пункту '{}' выполнен, кнопка raw='{}'",
+                                        self.profile_name, clicked_item_text, verified_raw or "—")
                         else:
-                            logger.warning("[{}] ⚠️ ВЕРИФИКАЦИЯ ПРОВАЛЕНА: target='{}', получено raw='{}'",
-                                           self.profile_name, target_model, verified_raw)
+                            logger.warning("[{}] ⚠️ ВЕРИФИКАЦИЯ ПРОВАЛЕНА: target='{}', получено raw='{}', clicked_item='{}'",
+                                           self.profile_name, target_model, verified_raw, clicked_item_text)
                     except Exception as ve:
                         logger.warning("[{}] Верификация модели не удалась: {}", self.profile_name, ve)
                     return
@@ -234,7 +374,7 @@ class BrowserManager:
                     try:
                         if bc.attrs.get("aria-haspopup") == "menu":
                             tc = (bc.text_all or "").strip()
-                            if any(k in tc.lower() for k in ("instant", "thinking", "auto")):
+                            if any(k in tc.lower() for k in ("instant", "thinking", "auto", "extended", "standard")):
                                 mode_btn_text = tc
                                 break
                     except Exception:
@@ -438,7 +578,14 @@ class BrowserManager:
                     logger.info("[{}] 📤 yield tail: len={}", self.profile_name, len(tail))
                     yield tail
             t_post_start = time.perf_counter()
-            await scroll_bottom(self.page)
+            t_scroll_start = time.perf_counter()
+            try:
+                await asyncio.wait_for(scroll_bottom(self.page), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("[{}] scroll_bottom таймаут 2s — пропускаем", self.profile_name)
+            except Exception as e:
+                logger.warning("[{}] scroll_bottom ошибка: {}", self.profile_name, e)
+            logger.info("[{}] ⏱ scroll_bottom: {:.2f}s", self.profile_name, time.perf_counter() - t_scroll_start)
             await asyncio.sleep(0.3)
             t_click_start = time.perf_counter()
             clicked = await click_download_buttons(self.page)

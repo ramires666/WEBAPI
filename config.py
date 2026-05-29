@@ -21,3 +21,7 @@ DUMP_MAX_AGE_DAYS = int(os.getenv("DUMP_MAX_AGE_DAYS", "7"))
 PROFILES = [p.strip() for p in os.getenv("PROFILES", "Profile 2").split(",") if p.strip()]
 PROFILES_DIR = os.getenv("PROFILES_DIR", r"W:\_python\APIPROXY\profiles")
 WORK_DIR = os.getenv("WORK_DIR", r"W:\_python\APIPROXY\work")
+
+# Профили, которые НЕ сворачиваются на старте (для визуального контроля при тестах).
+# Override через env: NO_MINIMIZE_PROFILES="Profile 2,Profile_Fixed"
+NO_MINIMIZE_PROFILES = [p.strip() for p in os.getenv("NO_MINIMIZE_PROFILES", "Profile_Fixed").split(",") if p.strip()]

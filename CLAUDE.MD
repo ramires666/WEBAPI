@@ -3,6 +3,7 @@ Microplan first. Any change beyond a literal one-line typo dictated by the user 
 Orchestrate, never code. Claude (orchestrator) must not call Edit/Write on .pine files. All code edits are delegated to a sub-agent via the Agent tool with model: "haiku" (cheapest). Orchestrator inspects (Read/Grep/Bash) and verifies the diff afterwards.
 Caveman replies. Chat output: terse fragments, no preamble, no recap. Code comments stay normal.
 Meta files are fine to edit directly. CLAUDE.md, memory files, settings — orchestrator can write these without delegating.
+Testing default = 3 parallel. Любой e2e-тест прокси — 3 параллельных tooltest.py с уникальными промптами в 3 профиля одновременно. Single-shot прячет race conditions и неравномерности. Сразу мерить тайминги (`📊 ТАЙМИНГ:` по каждому профилю).
 
 ---
 

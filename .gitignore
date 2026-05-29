@@ -22,5 +22,6 @@ venv/
 
 # Дампы и артефакты
 *.log
+logs/
 result.txt
 *_dump.html
