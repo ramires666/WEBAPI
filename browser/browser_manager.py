@@ -95,31 +95,48 @@ class BrowserManager:
         это button[aria-haspopup="menu"], чей текст = текущая модель
         (Instant/Thinking/Auto). Переключаем только если текущая != целевая —
         работает в обе стороны (в т.ч. Thinking->Instant)."""
-        target = target_model.strip().lower()
-        MODEL_NAMES = ("instant", "thinking", "auto")
+        target_low = target_model.strip().lower()
         try:
             buttons = await self.page.select_all("button")
         except Exception:
             buttons = []
-        selector_btn = None
-        current = ""
+
+        # Сбор кандидатов с aria-haspopup="menu" — диагностика
+        candidates = []
         for b in buttons or []:
             try:
-                if b.attrs.get("aria-haspopup") != "menu":
-                    continue
-                t = (b.text_all or "").strip().lower()
-                if t in MODEL_NAMES:
-                    selector_btn = b
-                    current = t
-                    break
+                if b.attrs.get("aria-haspopup") == "menu":
+                    candidates.append((b, (b.text_all or "").strip()))
             except Exception:
                 continue
+        logger.info("[{}] КНОПКИ-МЕНЮ aria-haspopup (всего {}): {}",
+                    self.profile_name, len(candidates),
+                    [t[:60] for _, t in candidates])
+
+        # Поиск кнопки-селектора модели: substring-матчинг
+        selector_btn = None
+        current_raw = ""
+        for b, raw in candidates:
+            tl = raw.lower()
+            if any(k in tl for k in ("instant", "thinking", "auto")) and "project" not in tl and "share" not in tl:
+                selector_btn = b
+                current_raw = raw
+                break
         if not selector_btn:
-            logger.warning("[{}] Кнопка выбора модели не найдена", self.profile_name)
+            logger.warning("[{}] Кнопка выбора модели не найдена (target='{}'). Кандидаты: {}",
+                           self.profile_name, target_model, [t[:60] for _, t in candidates])
             return
-        if current == target:
-            logger.info("[{}] Модель уже '{}' — переключение не нужно", self.profile_name, target_model)
+        logger.info("[{}] ТЕКУЩАЯ МОДЕЛЬ (raw): '{}' | target: '{}'",
+                    self.profile_name, current_raw, target_model)
+
+        # Определить, нужен ли клик: текущая модель содержит target (как substring, lowercase)
+        current_low = current_raw.lower()
+        if target_low in current_low:
+            logger.info("[{}] Модель уже соответствует target '{}' — переключение не нужно",
+                        self.profile_name, target_model)
             return
+
+        # Клик по кнопке
         if not await click_element(selector_btn):
             logger.warning("[{}] Не удалось кликнуть переключатель модели", self.profile_name)
             return
@@ -132,13 +149,35 @@ class BrowserManager:
             items = []
         logger.info("[{}] МЕНЮ МОДЕЛЕЙ ({}): {}", self.profile_name, len(items or []),
                     [(it.text_all or "").strip()[:50] for it in (items or [])])
+
+        # Выбор пункта с верификацией
         for it in items or []:
             try:
                 t = (it.text_all or "").strip().lower()
-                if t == target or (target in t and "project" not in t):
+                if target_low in t and "project" not in t:
                     await click_element(it)
-                    await asyncio.sleep(1.0)
-                    logger.info("[{}] Модель выбрана: {}", self.profile_name, target_model)
+                    await asyncio.sleep(1.2)
+                    # ВЕРИФИКАЦИЯ: перечитываем кнопку
+                    try:
+                        buttons2 = await self.page.select_all("button")
+                        verified_raw = ""
+                        for b2 in buttons2 or []:
+                            try:
+                                if b2.attrs.get("aria-haspopup") == "menu":
+                                    txt2 = (b2.text_all or "").strip()
+                                    if any(k in txt2.lower() for k in ("instant", "thinking", "auto")):
+                                        verified_raw = txt2
+                                        break
+                            except Exception:
+                                continue
+                        if target_low in verified_raw.lower():
+                            logger.info("[{}] ✅ ВЕРИФИКАЦИЯ: модель переключена на '{}' (raw='{}')",
+                                        self.profile_name, target_model, verified_raw)
+                        else:
+                            logger.warning("[{}] ⚠️ ВЕРИФИКАЦИЯ ПРОВАЛЕНА: target='{}', получено raw='{}'",
+                                           self.profile_name, target_model, verified_raw)
+                    except Exception as ve:
+                        logger.warning("[{}] Верификация модели не удалась: {}", self.profile_name, ve)
                     return
             except Exception:
                 continue
@@ -181,6 +220,24 @@ class BrowserManager:
             # момент диалога), а не только в новом чате. Для Instant — no-op.
             await self.select_model(target_model)
 
+            # Финальная верификация режима перед отправкой
+            try:
+                btns_check = await self.page.select_all("button")
+                mode_btn_text = ""
+                for bc in btns_check or []:
+                    try:
+                        if bc.attrs.get("aria-haspopup") == "menu":
+                            tc = (bc.text_all or "").strip()
+                            if any(k in tc.lower() for k in ("instant", "thinking", "auto")):
+                                mode_btn_text = tc
+                                break
+                    except Exception:
+                        continue
+                logger.info("[{}] 🎯 ОТПРАВКА в режиме: '{}' (target='{}')",
+                            self.profile_name, mode_btn_text or "?UNKNOWN?", target_model)
+            except Exception:
+                pass
+
             textarea = await find_element(self.page, COMPOSER_SELECTOR, timeout=10)
             if not textarea:
                 yield "Error: prompt textarea not found"
@@ -221,6 +278,7 @@ class BrowserManager:
                     i += 1
                 return i
 
+            completed_normally = False
             while time.time() - start < GENERATION_TIMEOUT:
                 stop_present = False
                 try:
@@ -278,6 +336,7 @@ class BrowserManager:
                     logger.info("[{}] Генерация завершена.", self.profile_name)
                     with open("temp/final_generation_dump.txt", "w", encoding="utf-8") as f:
                         f.write(last_text)
+                    completed_normally = True
                     break
                 # ответ так и не появился — не висим
                 if (not last_text or last_text == baseline) and (time.time() - start) > 25:
@@ -288,6 +347,21 @@ class BrowserManager:
                     await human_scroll(self.page)
                     last_scroll = time.time()
                 await asyncio.sleep(interval)
+
+            # Аномальное завершение цикла (таймаут или ответ не появился) — снимаем дамп DOM
+            if not completed_normally:
+                try:
+                    import os as _os
+                    _os.makedirs("temp", exist_ok=True)
+                    ts = int(time.time())
+                    html = await self.page.evaluate("document.documentElement.outerHTML")
+                    dump_path = f"temp/timeout_dump_{self.profile_name.replace(' ', '_')}_{ts}.html"
+                    with open(dump_path, "w", encoding="utf-8") as f:
+                        f.write(html or "")
+                    logger.warning("[{}] ⏱️ АНОМАЛЬНОЕ ЗАВЕРШЕНИЕ генерации (timeout={}, elapsed={:.1f}s). DOM dump: {}",
+                                   self.profile_name, GENERATION_TIMEOUT, time.time() - start, dump_path)
+                except Exception as de:
+                    logger.error("[{}] Не удалось снять DOM dump: {}", self.profile_name, de)
 
             # Досыл хвоста: гарантируем, что отдан ПОЛНЫЙ чистый финальный текст
             # (всё, что не успели отдать стабильным стримингом).
