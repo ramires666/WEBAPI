@@ -2,12 +2,12 @@ import json
 import re
 from typing import AsyncGenerator
 
-# Delimiter tool protocol (pandoc-style + English). The model emits raw blocks; we convert to native
+# Delimiter tool protocol (<<<verb>>> form — proven non-markdown). The model emits raw blocks; we convert to native
 # OpenAI tool_calls. No JSON escaping required from the model -> far more stable.
-# Format: :::verb attr="value":::...:::end:::
-_HEADER_RE = re.compile(r":::([a-z]+)\s*([^:]*?):::", re.IGNORECASE)
+# Format: <<<VERB attr="value">>>...<<<END>>>
+_HEADER_RE = re.compile(r"<<<(WRITE|EDIT|READ|BASH|GLOB|GREP)([^>]*)>>>", re.IGNORECASE)
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
-_END = ":::end:::"
+_END = "<<<END>>>"
 _THINKING_RE = re.compile(r'^(Thinking|Thought for \d+ seconds?)[\.\.\s]*', re.IGNORECASE)
 
 
@@ -21,8 +21,8 @@ class ResponseParser:
         return f"call_local_{self._n}"
 
     def _needs_body(self, verb: str, attrs: dict) -> bool:
-        """True if the block needs a closing :::end:::"""
-        return verb in ("write", "edit", "shell")
+        """True if the block needs a closing <<<END>>>"""
+        return verb in ("WRITE", "EDIT", "BASH")
 
     async def process_stream(self, chunk_stream: AsyncGenerator[str, None], model: str):
         async for chunk in chunk_stream:
@@ -75,32 +75,32 @@ class ResponseParser:
         """How many chars are safe to emit as text now (hold a possible partial marker)."""
         if final:
             return len(s)
-        # Hold partial ::: markers (1-3 colons)
-        for tail in (":::", "::", ":"):
+        # Hold partial <<< markers
+        for tail in ("<<<", "<<", "<"):
             if s.endswith(tail):
                 return len(s) - len(tail)
-        # If there's a ::: without a closing pair, hold from that point
-        idx = s.rfind(":::")
-        if idx != -1 and ":::" not in s[idx + 3:]:
+        # If there's a <<< without a closing pair, hold from that point
+        idx = s.rfind("<<<")
+        if idx != -1 and ">>>" not in s[idx:]:
             return idx
         return len(s)
 
     def _tool(self, verb: str, attrs: dict, body: str, model: str) -> str:
-        if verb == "write":
+        if verb == "WRITE":
             return self._tool_chunk("write", {"filePath": attrs.get("path", ""), "content": self._strip_fence(body)}, model)
-        if verb == "edit":
+        if verb == "EDIT":
             old, new = self._split_old_new(body)
             return self._tool_chunk("edit", {"filePath": attrs.get("path", ""), "oldString": old, "newString": new}, model)
-        if verb == "read":
+        if verb == "READ":
             return self._tool_chunk("read", {"filePath": attrs.get("path", "")}, model)
-        if verb == "shell":
+        if verb == "BASH":
             return self._tool_chunk("bash", {"command": self._strip_fence(body.strip())}, model)
-        if verb == "glob":
+        if verb == "GLOB":
             return self._tool_chunk("glob", {"pattern": attrs.get("pattern", "")}, model)
-        if verb == "grep":
+        if verb == "GREP":
             args = {"pattern": attrs.get("pattern", "")}
-            if attrs.get("in"):
-                args["path"] = attrs["in"]
+            if attrs.get("path"):
+                args["path"] = attrs["path"]
             return self._tool_chunk("grep", args, model)
         return self._content(body, model)
 
@@ -116,11 +116,11 @@ class ResponseParser:
         return "\n".join(lines)
 
     def _split_old_new(self, body: str):
-        o = body.find(":::was:::")
-        n = body.find(":::now:::")
+        o = body.find("<<<OLD>>>")
+        n = body.find("<<<NEW>>>")
         if o != -1 and n != -1 and n > o:
-            old = self._strip_fence(body[o + len(":::was:::"):n])
-            new = self._strip_fence(body[n + len(":::now:::"):])
+            old = self._strip_fence(body[o + len("<<<OLD>>>"):n])
+            new = self._strip_fence(body[n + len("<<<NEW>>>"):])
             return old, new
         return self._strip_fence(body), ""
 

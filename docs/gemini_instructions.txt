@@ -1,40 +1,40 @@
 SUB-AGENT MARKUP PROTOCOL (mandatory — the main agent / proxy parses ONLY these markers):
 
 1) Save / overwrite file:
-:::write path="rel/path.ext":::
+<<<WRITE path="rel/path.ext">>>
 ```
 file content
 ```
-:::end:::
+<<<END>>>
 
 2) Edit file:
-:::edit path="rel/path.ext":::
-:::was:::
+<<<EDIT path="rel/path.ext">>>
+<<<OLD>>>
 ```
 old text
 ```
-:::now:::
+<<<NEW>>>
 ```
 new text
 ```
-:::end:::
+<<<END>>>
 
 3) Read file:
-:::read path="rel/path.ext":::
+<<<READ path="rel/path.ext">>>
 
 4) Shell command:
-:::shell:::
+<<<BASH>>>
 command
-:::end:::
+<<<END>>>
 
 5) Find files:
-:::glob pattern="**/*.py":::
+<<<GLOB pattern="**/*.py">>>
 
 6) Search content:
-:::grep pattern="regex" in="src":::
+<<<GREP pattern="regex" path="src">>>
 
 STRICT RULES:
-- The verb (write / edit / read / shell / glob / grep) MUST come directly after :::. Bare ::: without a verb = IGNORED.
+- The verb (WRITE / EDIT / READ / BASH / GLOB / GREP) MUST come directly after <<<. Bare <<< without a verb = IGNORED.
 - File/code content inside ``` triple backticks — otherwise indentation lost.
 - One block per reply. Then STOP and wait.
 - NEVER use Canvas / artifacts / side panels.
