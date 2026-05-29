@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ORIGINAL_CHROME_USER_DATA = os.path.join(os.environ["LOCALAPPDATA"], "Google", "Chrome", "User Data")
-WORKING_PROFILE_DIR = r"W:\_python\APIPROXY\chrome_work_profile"
 CHROME_PROFILE_NAME = "Profile 2"
 CHATGPT_URL = "https://chatgpt.com"
 GENERATION_TIMEOUT = 300
