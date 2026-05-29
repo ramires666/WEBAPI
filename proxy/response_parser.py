@@ -5,7 +5,7 @@ from typing import AsyncGenerator
 # Delimiter tool protocol (<<<verb>>> form — proven non-markdown). The model emits raw blocks; we convert to native
 # OpenAI tool_calls. No JSON escaping required from the model -> far more stable.
 # Format: <<<VERB attr="value">>>...<<<END>>>
-_HEADER_RE = re.compile(r"<<<(WRITE|EDIT|READ|BASH|GLOB|GREP)([^>]*)>>>", re.IGNORECASE)
+_HEADER_RE = re.compile(r"<<<(WRITE|EDIT|READ|BASH|GLOB|GREP|FETCH|TODO|TASK|ASK)([^>]*)>>>", re.IGNORECASE)
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 _END = "<<<END>>>"
 _THINKING_RE = re.compile(r'^(Thinking|Thought for \d+ seconds?)[\.\.\s]*', re.IGNORECASE)
@@ -22,7 +22,7 @@ class ResponseParser:
 
     def _needs_body(self, verb: str, attrs: dict) -> bool:
         """True if the block needs a closing <<<END>>>"""
-        return verb in ("WRITE", "EDIT", "BASH")
+        return verb.upper() in ("WRITE", "EDIT", "BASH", "TODO", "TASK")
 
     async def process_stream(self, chunk_stream: AsyncGenerator[str, None], model: str):
         async for chunk in chunk_stream:
@@ -102,6 +102,28 @@ class ResponseParser:
             if attrs.get("path"):
                 args["path"] = attrs["path"]
             return self._tool_chunk("grep", args, model)
+        if verb == "FETCH":
+            args = {"url": attrs.get("url", "")}
+            if attrs.get("format"):
+                args["format"] = attrs["format"]
+            return self._tool_chunk("webfetch", args, model)
+        if verb == "TODO":
+            todos = self._parse_todo_body(body)
+            return self._tool_chunk("todowrite", {"todos": todos}, model)
+        if verb == "TASK":
+            args = {
+                "subagent_type": attrs.get("type", "general-purpose"),
+                "description": attrs.get("desc", ""),
+                "prompt": body.strip(),
+            }
+            return self._tool_chunk("task", args, model)
+        if verb == "ASK":
+            opts_raw = attrs.get("options", "")
+            options = [{"label": o.strip()} for o in opts_raw.split("|") if o.strip()]
+            question_obj = {"question": attrs.get("q", ""), "header": (attrs.get("q", "")[:12] or "Q")}
+            if options:
+                question_obj["options"] = options
+            return self._tool_chunk("question", {"questions": [question_obj]}, model)
         return self._content(body, model)
 
     def _strip_fence(self, s: str) -> str:
@@ -123,6 +145,28 @@ class ResponseParser:
             new = self._strip_fence(body[n + len("<<<NEW>>>"):])
             return old, new
         return self._strip_fence(body), ""
+
+    def _parse_todo_body(self, body: str) -> list:
+        """Parse bullet-list of todos into [{content, status, priority}].
+        Lines starting with '-', '*', or '1.' (numbered) become items."""
+        items = []
+        for line in body.strip().splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            # Strip leading bullet/number markers
+            for prefix in ("- ", "* ", "+ "):
+                if s.startswith(prefix):
+                    s = s[len(prefix):]
+                    break
+            else:
+                # Numbered list (1. 2. ...)
+                m = re.match(r"^\d+[.)]\s+(.+)$", s)
+                if m:
+                    s = m.group(1)
+            if s:
+                items.append({"content": s, "status": "pending", "priority": "medium"})
+        return items
 
     def _content(self, content: str, model: str) -> str:
         # Стрип артефактов рендера, просочившихся через DOM

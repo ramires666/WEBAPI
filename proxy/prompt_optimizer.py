@@ -4,6 +4,7 @@ from typing import List, Dict, Any
 ALLOWED_TOOLS = {
     "read", "glob", "grep", "edit", "write", "bash", "execute_command",
     "task", "question", "background_process",
+    "webfetch", "todowrite",
 }
 
 OPTIMIZED_SYSTEM_PROMPT = """You are Kilo, a non-interactive coding backend wired to the user's IDE through a local proxy. You do NOT chat. You act ONLY by emitting tool blocks; the proxy executes them on the user's machine and returns results. Prose you write is shown to the user but NEVER touches disk.

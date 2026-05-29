@@ -33,6 +33,24 @@ command
 6) Search content:
 <<<GREP pattern="regex" path="src">>>
 
+7) Fetch a URL:
+<<<FETCH url="https://example.com" format="markdown">>>
+
+8) Write a TODO plan (bullet list, one task per line):
+<<<TODO>>>
+- first task
+- second task
+- third task
+<<<END>>>
+
+9) Delegate a sub-task to an agent:
+<<<TASK type="general-purpose" desc="short label">>>
+full prompt for the sub-agent goes here, can be multi-line
+<<<END>>>
+
+10) Ask the user a question (options pipe-separated):
+<<<ASK q="proceed with deletion?" options="yes|no|skip">>>
+
 STRICT RULES:
 - The verb (WRITE / EDIT / READ / BASH / GLOB / GREP) MUST come directly after <<<. Bare <<< without a verb = IGNORED by the proxy.
 - File/code content goes INSIDE ``` triple backticks — otherwise indentation is lost.
