@@ -206,6 +206,7 @@ class BrowserManager:
             start = time.time()
             last_change = start
             last_scroll = start
+            last_focus_refresh = start
             seen_activity = False
             baseline = await read_last_assistant(self.page)  # текст ДО ответа (для продолжения чата)
             last_text = baseline
@@ -255,6 +256,11 @@ class BrowserManager:
                 if stop_present:
                     seen_activity = True
                     last_change = time.time()
+
+                # Периодический refresh CDP-эмуляции фокуса (раз в 5 секунд)
+                if time.time() - last_focus_refresh >= 5.0:
+                    await self._apply_focus_emulation()
+                    last_focus_refresh = time.time()
 
                 # завершено: новый непустой текст, Stop исчез, текст стабилен ~2с
                 if last_text and last_text != baseline and not stop_present and (time.time() - last_change) >= 2.0:
