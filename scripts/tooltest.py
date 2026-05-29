@@ -9,8 +9,8 @@ TOOLS = [
 ]
 
 
-def run(task: str):
-    payload = {"model": "Instant", "stream": True, "tools": TOOLS, "messages": [
+def run(task: str, model: str = "Instant"):
+    payload = {"model": model, "stream": True, "tools": TOOLS, "messages": [
         {"role": "system", "content": "You are Kilo. <env>cwd=W:/test</env>"},
         {"role": "user", "content": task}]}
     req = urllib.request.Request("http://127.0.0.1:8000/v1/chat/completions",
@@ -48,5 +48,7 @@ def run(task: str):
 
 
 if __name__ == "__main__":
+    # Usage: python scripts/tooltest.py "<task>" [Instant|Thinking]
     task = sys.argv[1] if len(sys.argv) > 1 else "say hi"
-    run(task)
+    model = sys.argv[2] if len(sys.argv) > 2 else "Instant"
+    run(task, model)
