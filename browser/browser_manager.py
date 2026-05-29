@@ -65,6 +65,12 @@ class BrowserManager:
         config = uc.Config()
         config.user_data_dir = os.path.join(self.work_dir, self.profile_name)
         config.add_argument("--profile-directory=Default")
+        # Анти-throttle: Chrome не должен замораживать таймеры/рендер в фоновых
+        # окнах (CDP setFocusEmulationEnabled не покрывает process-level
+        # backgrounding — нужны явные флаги запуска).
+        config.add_argument("--disable-background-timer-throttling")
+        config.add_argument("--disable-backgrounding-occluded-windows")
+        config.add_argument("--disable-renderer-backgrounding")
         self.browser = await uc.start(config)
         self.page = await self.browser.get(CHATGPT_URL)
         await asyncio.sleep(4)
@@ -255,8 +261,55 @@ class BrowserManager:
 
             await asyncio.sleep(0.8)
             send_btn = await find_element(self.page, SEND_SELECTOR, timeout=3)
-            if not await click_element(send_btn):
+
+            # Ждём пока кнопка станет enabled (composer на доли секунды дизейблит
+            # её после вставки текста — клик по disabled "проходит", но не шлёт).
+            if send_btn:
+                for _ in range(20):  # до ~2с
+                    try:
+                        dis = send_btn.attrs.get("disabled")
+                        aria_dis = send_btn.attrs.get("aria-disabled")
+                        if not dis and aria_dis not in ("true", True):
+                            break
+                    except Exception:
+                        break
+                    await asyncio.sleep(0.1)
+                    try:
+                        send_btn = await find_element(self.page, SEND_SELECTOR, timeout=0.5)
+                        if not send_btn:
+                            break
+                    except Exception:
+                        break
+                try:
+                    dis_final = send_btn.attrs.get("disabled") if send_btn else "no-btn"
+                    aria_final = send_btn.attrs.get("aria-disabled") if send_btn else "no-btn"
+                    logger.info("[{}] 🔘 send state: disabled={}, aria-disabled={}",
+                                self.profile_name, dis_final, aria_final)
+                except Exception:
+                    pass
+
+            click_ok = await click_element(send_btn) if send_btn else False
+            if not click_ok:
+                logger.info("[{}] 🔁 SUBMIT FALLBACK Enter (нет кнопки или клик не удался)", self.profile_name)
                 await send_key(self.page, "Enter", 13)
+
+            # Верификация: если через 0.7с textarea всё ещё содержит наш промпт
+            # (или его начало), значит submit не сработал — досылаем Enter.
+            await asyncio.sleep(0.7)
+            try:
+                ta_now = await find_element(self.page, COMPOSER_SELECTOR, timeout=0.5)
+                ta_text = (ta_now.text_all or "") if ta_now else ""
+                # Берём первые 40 символов промпта как маркер
+                marker = prompt_text[:40].strip()
+                if marker and marker in ta_text:
+                    logger.warning("[{}] 🔁 SUBMIT FALLBACK Enter (промпт всё ещё в textarea: {!r})",
+                                   self.profile_name, ta_text[:60])
+                    if ta_now:
+                        await click_element(ta_now)
+                        await asyncio.sleep(0.2)
+                    await send_key(self.page, "Enter", 13)
+            except Exception as ve:
+                logger.debug("[{}] verify-submit failed: {}", self.profile_name, ve)
 
             logger.info("[{}] Запрос отправлен. Ждём генерацию...", self.profile_name)
             interval = 0.4
