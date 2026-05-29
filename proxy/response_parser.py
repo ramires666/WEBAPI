@@ -2,12 +2,12 @@ import json
 import re
 from typing import AsyncGenerator
 
-# Delimiter tool protocol (pandoc-style + Russian). The model emits raw blocks; we convert to native
+# Delimiter tool protocol (pandoc-style + English). The model emits raw blocks; we convert to native
 # OpenAI tool_calls. No JSON escaping required from the model -> far more stable.
-# Format: :::verb attr="value":::...:::конец:::
-_HEADER_RE = re.compile(r":::([а-яё]+)\s*([^:]*?):::", re.IGNORECASE | re.UNICODE)
-_ATTR_RE = re.compile(r'([а-яё]+)="([^"]*)"', re.IGNORECASE | re.UNICODE)
-_END = ":::конец:::"
+# Format: :::verb attr="value":::...:::end:::
+_HEADER_RE = re.compile(r":::([a-z]+)\s*([^:]*?):::", re.IGNORECASE)
+_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+_END = ":::end:::"
 _THINKING_RE = re.compile(r'^(Thinking|Thought for \d+ seconds?)[\.\.\s]*', re.IGNORECASE)
 
 
@@ -21,12 +21,8 @@ class ResponseParser:
         return f"call_local_{self._n}"
 
     def _needs_body(self, verb: str, attrs: dict) -> bool:
-        """True if the block needs a closing :::конец:::"""
-        if verb == "файл" and ("создать" in attrs or "правка" in attrs):
-            return True
-        if verb == "оболочка":
-            return True
-        return False
+        """True if the block needs a closing :::end:::"""
+        return verb in ("write", "edit", "shell")
 
     async def process_stream(self, chunk_stream: AsyncGenerator[str, None], model: str):
         async for chunk in chunk_stream:
@@ -90,22 +86,21 @@ class ResponseParser:
         return len(s)
 
     def _tool(self, verb: str, attrs: dict, body: str, model: str) -> str:
-        if verb == "файл":
-            if "создать" in attrs:
-                return self._tool_chunk("write", {"filePath": attrs["создать"], "content": self._strip_fence(body)}, model)
-            if "правка" in attrs:
-                old, new = self._split_old_new(body)
-                return self._tool_chunk("edit", {"filePath": attrs["правка"], "oldString": old, "newString": new}, model)
-            if "читать" in attrs:
-                return self._tool_chunk("read", {"filePath": attrs["читать"]}, model)
-        if verb == "оболочка":
+        if verb == "write":
+            return self._tool_chunk("write", {"filePath": attrs.get("path", ""), "content": self._strip_fence(body)}, model)
+        if verb == "edit":
+            old, new = self._split_old_new(body)
+            return self._tool_chunk("edit", {"filePath": attrs.get("path", ""), "oldString": old, "newString": new}, model)
+        if verb == "read":
+            return self._tool_chunk("read", {"filePath": attrs.get("path", "")}, model)
+        if verb == "shell":
             return self._tool_chunk("bash", {"command": self._strip_fence(body.strip())}, model)
-        if verb == "файлы":
-            return self._tool_chunk("glob", {"pattern": attrs.get("шаблон", "")}, model)
-        if verb == "текст":
-            args = {"pattern": attrs.get("поиск", "")}
-            if attrs.get("в"):
-                args["path"] = attrs["в"]
+        if verb == "glob":
+            return self._tool_chunk("glob", {"pattern": attrs.get("pattern", "")}, model)
+        if verb == "grep":
+            args = {"pattern": attrs.get("pattern", "")}
+            if attrs.get("in"):
+                args["path"] = attrs["in"]
             return self._tool_chunk("grep", args, model)
         return self._content(body, model)
 
@@ -121,11 +116,11 @@ class ResponseParser:
         return "\n".join(lines)
 
     def _split_old_new(self, body: str):
-        o = body.find(":::было:::")
-        n = body.find(":::стало:::")
+        o = body.find(":::was:::")
+        n = body.find(":::now:::")
         if o != -1 and n != -1 and n > o:
-            old = self._strip_fence(body[o + len(":::было:::"):n])
-            new = self._strip_fence(body[n + len(":::стало:::"):])
+            old = self._strip_fence(body[o + len(":::was:::"):n])
+            new = self._strip_fence(body[n + len(":::now:::"):])
             return old, new
         return self._strip_fence(body), ""
 
