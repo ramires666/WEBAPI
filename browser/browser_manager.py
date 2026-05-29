@@ -47,6 +47,19 @@ class BrowserManager:
             logger.info("[{}] Копирую профиль {} → {}", self.profile_name, src, dst)
             shutil.copytree(src, dst, dirs_exist_ok=True)
 
+    async def _apply_focus_emulation(self):
+        """Применить CDP-эмуляцию фокуса. Вызывать ПОСЛЕ каждой навигации
+        (page.get), иначе настройка теряется и ChatGPT начинает throttle'ить
+        фоновые вкладки."""
+        try:
+            await self.page.send(cdp_emulation.set_focus_emulation_enabled(enabled=True))
+        except Exception as e:
+            logger.warning("[{}] Focus emulation failed: {}", self.profile_name, e)
+        try:
+            await self.page.send(cdp_page.set_web_lifecycle_state(state="active"))
+        except Exception as e:
+            logger.warning("[{}] Lifecycle set failed: {}", self.profile_name, e)
+
     async def start_browser(self):
         self.setup_profile()
         config = uc.Config()
@@ -57,16 +70,8 @@ class BrowserManager:
         await asyncio.sleep(4)
 
         # Эмуляция фокуса — чтобы ChatGPT не throttle'ил стрим в фоновых вкладках
-        try:
-            await self.page.send(cdp_emulation.set_focus_emulation_enabled(enabled=True))
-            logger.info("[{}] Focus emulation: ON", self.profile_name)
-        except Exception as e:
-            logger.warning("[{}] Focus emulation failed: {}", self.profile_name, e)
-        try:
-            await self.page.send(cdp_page.set_web_lifecycle_state(state="active"))
-            logger.info("[{}] Lifecycle: active", self.profile_name)
-        except Exception as e:
-            logger.warning("[{}] Lifecycle set failed: {}", self.profile_name, e)
+        await self._apply_focus_emulation()
+        logger.info("[{}] Focus emulation and lifecycle applied", self.profile_name)
 
         os.makedirs(TEMP_DOWNLOADS, exist_ok=True)
         try:
@@ -159,12 +164,14 @@ class BrowserManager:
                 logger.info("[{}] === НАЧАЛО НОВОГО ЧАТА ===", self.profile_name)
                 await self.page.get(CHATGPT_URL)
                 await asyncio.sleep(3.5)
+                await self._apply_focus_emulation()
             elif chat_url:
                 current_url = await self.get_current_url()
                 if current_url.rstrip("/") != chat_url.rstrip("/"):
                     logger.info("[{}] === ПЕРЕХОД В ЧАТ {} ===", self.profile_name, chat_url)
                     await self.page.get(chat_url)
                     await asyncio.sleep(3.0)
+                    await self._apply_focus_emulation()
                 else:
                     logger.info("[{}] === ЧАТ {} УЖЕ ОТКРЫТ ===", self.profile_name, chat_url)
             else:
@@ -251,6 +258,17 @@ class BrowserManager:
 
                 # завершено: новый непустой текст, Stop исчез, текст стабилен ~2с
                 if last_text and last_text != baseline and not stop_present and (time.time() - last_change) >= 2.0:
+                    # Defensive: модель иногда шлёт короткое "ОК" → потом отдельное сообщение
+                    # с tool-блоком. Подождём ещё 3с и перечитаем last_assistant; если текст
+                    # изменился (новое сообщение) — продолжаем цикл.
+                    await asyncio.sleep(3.0)
+                    post_text = await read_last_assistant(self.page)
+                    if post_text and post_text != last_text:
+                        logger.info("[{}] После 'завершения' появился новый текст — продолжаем", self.profile_name)
+                        last_text = post_text
+                        last_change = time.time()
+                        seen_activity = True
+                        continue
                     logger.info("[{}] Генерация завершена.", self.profile_name)
                     with open("temp/final_generation_dump.txt", "w", encoding="utf-8") as f:
                         f.write(last_text)
