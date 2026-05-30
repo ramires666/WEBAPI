@@ -213,6 +213,7 @@ class ResponseParser:
         ci = content.find("[Canvas]")
         if ci != -1:
             content = content[:ci]
+        content = content.replace("<<<END>>>", "")
         if not content.strip():
             return ""  # Не отправляем пустые чанки
         data = {
