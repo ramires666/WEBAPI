@@ -23,4 +23,4 @@ WORK_DIR = os.getenv("WORK_DIR", r"W:\_python\APIPROXY\work")
 
 # Профили, которые НЕ сворачиваются на старте (для визуального контроля при тестах).
 # Override через env: NO_MINIMIZE_PROFILES="Profile 2,Profile_Fixed"
-NO_MINIMIZE_PROFILES = [p.strip() for p in os.getenv("NO_MINIMIZE_PROFILES", "Profile_Fixed").split(",") if p.strip()]
+NO_MINIMIZE_PROFILES = [p.strip() for p in os.getenv("NO_MINIMIZE_PROFILES", "Profile 2,Profile 4,Profile_Fixed").split(",") if p.strip()]

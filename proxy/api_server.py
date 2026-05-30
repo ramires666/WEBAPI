@@ -54,7 +54,7 @@ class ChatCompletionRequest(BaseModel):
 
 current_state = ConversationStore()
 
-from proxy.prompt_optimizer import optimize_tools, optimize_system_message
+from proxy.prompt_optimizer import optimize_tools, optimize_system_message, PROXY_REMINDER
 
 def format_delta_prompt(delta_messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None, is_new_chat: bool = False) -> str:
     prompt = ""
@@ -79,7 +79,7 @@ def format_delta_prompt(delta_messages: List[ChatMessage], tools: Optional[List[
         elif msg.role == "tool":
             prompt += f"[Результат инструмента]: {content}\n\n"
 
-    final_prompt = prompt.strip()
+    final_prompt = prompt.strip() + PROXY_REMINDER
     logger.info(f"🚀 Сформирован промпт для браузера: {len(final_prompt)} символов (было бы ~40k+ без оптимизации).")
     return final_prompt
 

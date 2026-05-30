@@ -54,6 +54,8 @@ Assistant:
 <<<END>>>
 """
 
+PROXY_REMINDER = "\n\n[PROXY PROTOCOL] Respond ONLY by emitting ONE PROXY MARKUP block (<<<VERB ...>>>...<<<END>>>). No Canvas, no downloads, no file attachments, no Atlas widgets — any output outside markers is DISCARDED by the proxy."
+
 def optimize_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Отфильтровывает ненужные инструменты и сильно урезает описания."""
     if not tools:

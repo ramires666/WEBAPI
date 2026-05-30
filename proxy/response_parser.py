@@ -5,7 +5,7 @@ from typing import AsyncGenerator
 # Delimiter tool protocol (<<<verb>>> form — proven non-markdown). The model emits raw blocks; we convert to native
 # OpenAI tool_calls. No JSON escaping required from the model -> far more stable.
 # Format: <<<VERB attr="value">>>...<<<END>>>
-_HEADER_RE = re.compile(r"<<<(WRITE|EDIT|READ|BASH|GLOB|GREP|FETCH|TODO|TASK|ASK)([^>]*)>>>", re.IGNORECASE)
+_HEADER_RE = re.compile(r"<<<(WRITE|EDIT|READ|BASH|GLOB|GREP|FETCH|TODO|TASK|ASK|MSG)([^>]*)>>>", re.IGNORECASE)
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 _END = "<<<END>>>"
 _THINKING_RE = re.compile(r'^(Thinking|Thought for \d+ seconds?)[\.\.\s]*', re.IGNORECASE)
@@ -22,7 +22,7 @@ class ResponseParser:
 
     def _needs_body(self, verb: str, attrs: dict) -> bool:
         """True if the block needs a closing <<<END>>>"""
-        return verb.upper() in ("WRITE", "EDIT", "BASH", "TODO", "TASK")
+        return verb.upper() in ("WRITE", "EDIT", "BASH", "TODO", "TASK", "MSG")
 
     async def process_stream(self, chunk_stream: AsyncGenerator[str, None], model: str):
         async for chunk in chunk_stream:
@@ -86,6 +86,8 @@ class ResponseParser:
         return len(s)
 
     def _tool(self, verb: str, attrs: dict, body: str, model: str) -> str:
+        if verb == "MSG":
+            return self._content(self._strip_fence(body), model)
         if verb == "WRITE":
             return self._tool_chunk("write", {"filePath": attrs.get("path", ""), "content": self._strip_fence(body)}, model)
         if verb == "EDIT":
