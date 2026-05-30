@@ -2,10 +2,12 @@ import json
 import re
 from typing import AsyncGenerator
 
+from proxy import bg_registry
+
 # Delimiter tool protocol (<<<verb>>> form — proven non-markdown). The model emits raw blocks; we convert to native
 # OpenAI tool_calls. No JSON escaping required from the model -> far more stable.
 # Format: <<<VERB attr="value">>>...<<<END>>>
-_HEADER_RE = re.compile(r"<<<(WRITE|EDIT|READ|BASH|GLOB|GREP|FETCH|TODO|TASK|ASK|MSG)([^>]*)>>>", re.IGNORECASE)
+_HEADER_RE = re.compile(r"<<<(WRITE|EDIT|READ|BASH|GLOB|GREP|FETCH|TODO|TASK|ASK|MSG|BG_STATUS|BG_TAIL|BG_STOP|BG)([^>]*)>>>", re.IGNORECASE)
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 _END = "<<<END>>>"
 _THINKING_RE = re.compile(r'^(Thinking|Thought for \d+ seconds?)[\.\.\s]*', re.IGNORECASE)
@@ -88,6 +90,40 @@ class ResponseParser:
     def _tool(self, verb: str, attrs: dict, body: str, model: str) -> str:
         if verb == "MSG":
             return self._content(self._strip_fence(body), model)
+        if verb == "BG":
+            cmd = attrs.get("cmd", "")
+            if not cmd:
+                return self._content("bg_error: missing cmd attribute", model)
+            try:
+                res = bg_registry.start(cmd)
+                return self._content(f"bg_id={res['bg_id']} started: {res['cmd']}", model)
+            except Exception as e:
+                return self._content(f"bg_error: {e}", model)
+        if verb == "BG_STATUS":
+            bg_id = attrs.get("id", "")
+            s = bg_registry.status(bg_id)
+            if s is None:
+                return self._content("bg_error: not found", model)
+            return self._content(
+                f"bg_id={s['bg_id']} alive={str(s['alive']).lower()} pid={s['pid']} exit_code={s['exit_code']} started_at={s['started_at']}",
+                model,
+            )
+        if verb == "BG_TAIL":
+            bg_id = attrs.get("id", "")
+            try:
+                n = int(attrs.get("lines", "50"))
+            except ValueError:
+                n = 50
+            t = bg_registry.tail(bg_id, n)
+            if t is None:
+                return self._content("bg_error: not found", model)
+            return self._content(f"```\n{t}\n```", model)
+        if verb == "BG_STOP":
+            bg_id = attrs.get("id", "")
+            r = bg_registry.stop(bg_id)
+            if r is None:
+                return self._content("bg_error: not found", model)
+            return self._content(f"bg_id={r['bg_id']} stopped exit_code={r['exit_code']}", model)
         if verb == "WRITE":
             return self._tool_chunk("write", {"filePath": attrs.get("path", ""), "content": self._strip_fence(body)}, model)
         if verb == "EDIT":

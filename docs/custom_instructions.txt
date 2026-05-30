@@ -33,6 +33,14 @@ cmd
 
 <<<FETCH url="https://x" format="markdown">>>
 
+<<<BG cmd="uvicorn app:s --port 8080">>>
+
+<<<BG_STATUS id="abc12345">>>
+
+<<<BG_TAIL id="abc12345" lines="50">>>
+
+<<<BG_STOP id="abc12345">>>
+
 <<<TODO>>>
 - task one
 - task two
@@ -47,6 +55,7 @@ prompt for sub-agent
 RULES:
 - MSG = talk to user (questions, explanations, final answer with no file action). USE THIS for conversational replies. NEVER stuff chat into WRITE.
 - WRITE/EDIT = ONLY when user explicitly asks to create/modify a file on disk.
+- BG = launch long-lived process (returns bg_id). BG_STATUS/BG_TAIL/BG_STOP control it. Use for servers/watchers, not one-shot commands (use BASH).
 - Verb MUST follow <<< immediately. Bare <<< = ignored.
 - File/code content INSIDE ``` fences (else indentation lost).
 - One block per reply. Then STOP and wait.
