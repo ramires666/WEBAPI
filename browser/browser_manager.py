@@ -25,6 +25,23 @@ warnings.filterwarnings('ignore', category=ResourceWarning)
 STOP_SELECTOR = 'button[aria-label="Stop generating"], button[data-testid="stop-button"]'
 SEND_SELECTOR = '[data-testid="send-button"], button[data-testid="composer-send-button"]'
 COMPOSER_SELECTOR = "#prompt-textarea"
+# JS shim, injected on every navigation via Page.addScriptToEvaluateOnNewDocument.
+# Forces the page to act as if it's always focused+visible — bypasses Chrome's
+# OS-level focus throttling that even --disable-renderer-backgrounding can't fully kill.
+FOCUS_SHIM_JS = """
+(() => {
+  try {
+    Object.defineProperty(document, 'visibilityState', {get: () => 'visible', configurable: true});
+    Object.defineProperty(document, 'hidden', {get: () => false, configurable: true});
+    Object.defineProperty(document, 'webkitVisibilityState', {get: () => 'visible', configurable: true});
+    Object.defineProperty(document, 'webkitHidden', {get: () => false, configurable: true});
+    document.hasFocus = () => true;
+    window.addEventListener('visibilitychange', e => { e.stopImmediatePropagation(); }, true);
+    window.addEventListener('webkitvisibilitychange', e => { e.stopImmediatePropagation(); }, true);
+    window.addEventListener('blur', e => { e.stopImmediatePropagation(); }, true);
+  } catch (e) { /* swallow */ }
+})();
+"""
 PERSONALITY_YES = 'button[aria-label="Yes, I like this personality"]'
 MODEL_KEYWORDS = ("instant", "thinking", "auto", "gpt", "chatgpt", "model", "модель")
 
@@ -48,9 +65,9 @@ class BrowserManager:
             shutil.copytree(src, dst, dirs_exist_ok=True)
 
     async def _apply_focus_emulation(self):
-        """Применить CDP-эмуляцию фокуса. Вызывать ПОСЛЕ каждой навигации
-        (page.get), иначе настройка теряется и ChatGPT начинает throttle'ить
-        фоновые вкладки."""
+        """Применить CDP-эмуляцию фокуса + JS-шим visibility/hasFocus.
+        Вызывать ПОСЛЕ каждой навигации (page.get), иначе настройка теряется
+        и ChatGPT начинает throttle'ить фоновые вкладки."""
         try:
             await self.page.send(cdp_emulation.set_focus_emulation_enabled(enabled=True))
         except Exception as e:
@@ -59,6 +76,17 @@ class BrowserManager:
             await self.page.send(cdp_page.set_web_lifecycle_state(state="active"))
         except Exception as e:
             logger.warning("[{}] Lifecycle set failed: {}", self.profile_name, e)
+        # JS-шим: переопределяет visibilityState/hidden/hasFocus, гасит
+        # visibilitychange/blur — страницa "не знает", что вкладка фоновая.
+        try:
+            await self.page.send(cdp_page.add_script_to_evaluate_on_new_document(source=FOCUS_SHIM_JS))
+        except Exception as e:
+            logger.warning("[{}] add_script_to_evaluate_on_new_document failed: {}", self.profile_name, e)
+        # Применить шим к УЖЕ загруженной странице (на новый документ — addScript, но текущий уже отрендерен).
+        try:
+            await asyncio.wait_for(self.page.evaluate(FOCUS_SHIM_JS), timeout=3.0)
+        except Exception as e:
+            logger.debug("[{}] focus shim eval failed: {}", self.profile_name, e)
 
     async def start_browser(self):
         self.setup_profile()
@@ -345,6 +373,27 @@ class BrowserManager:
 
     async def send_prompt_and_stream(self, prompt_text: str, target_model: str, is_new_chat: bool, chat_url: str = None):
         async with self._lock:
+            # HEALTH CHECK: probe CDP — if tab is frozen/dead, reload before anything else.
+            try:
+                await asyncio.wait_for(self.page.evaluate("1"), timeout=5.0)
+            except Exception as _hc_err:
+                logger.warning("[{}] 🚨 TAB UNHEALTHY ({}) — пробую reload", self.profile_name, _hc_err)
+                try:
+                    await asyncio.wait_for(self.page.reload(), timeout=20.0)
+                    await asyncio.sleep(3.0)
+                    await self._apply_focus_emulation()
+                    logger.info("[{}] ✅ tab reload OK", self.profile_name)
+                except Exception as _rl_err:
+                    logger.error("[{}] 🚨 RELOAD FAILED ({}) — abort", self.profile_name, _rl_err)
+                    yield f"Error: tab dead and reload failed: {_rl_err}"
+                    return
+
+            # BUG FIX 1: wake the tab regardless of branch — prevents background-throttle stalls
+            try:
+                await asyncio.wait_for(self.page.bring_to_front(), timeout=5.0)
+            except Exception as _bt_err:
+                logger.debug("[{}] bring_to_front failed: {}", self.profile_name, _bt_err)
+
             if is_new_chat:
                 logger.info("[{}] === НАЧАЛО НОВОГО ЧАТА ===", self.profile_name)
                 await self.page.get(CHATGPT_URL)
@@ -365,6 +414,21 @@ class BrowserManager:
             # Модель применяем перед КАЖДЫМ сообщением (её можно менять в любой
             # момент диалога), а не только в новом чате. Для Instant — no-op.
             await self.select_model(target_model)
+
+            # BUG FIX 2: ensure textarea is empty before typing — Chrome may restore stale composer text
+            try:
+                _ta = await find_element(self.page, COMPOSER_SELECTOR, timeout=5)
+                _ta_text = (_ta.text_all or "").strip() if _ta else ""
+                if _ta and _ta_text:
+                    logger.warning("[{}] 🧹 Стейл-текст в textarea ({} симв): чистим", self.profile_name, len(_ta_text))
+                    # triple-click selects all in contenteditable
+                    for _ in range(3):
+                        await click_element(_ta)
+                        await asyncio.sleep(0.05)
+                    await send_key(self.page, "Delete", 46)
+                    await asyncio.sleep(0.2)
+            except Exception as _cl_err:
+                logger.debug("[{}] textarea clear skipped: {}", self.profile_name, _cl_err)
 
             # Финальная верификация режима перед отправкой
             try:
@@ -461,7 +525,11 @@ class BrowserManager:
             last_scroll = start
             last_focus_refresh = start
             seen_activity = False
-            baseline = await read_last_assistant(self.page)  # текст ДО ответа (для продолжения чата)
+            try:
+                baseline = await asyncio.wait_for(read_last_assistant(self.page), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("[{}] baseline read_last_assistant timeout 15s — using empty baseline", self.profile_name)
+                baseline = ""
             last_text = baseline
             prev_text = baseline
             emitted = ""        # часть НОВОГО ответа, уже отданная клиенту
@@ -478,13 +546,22 @@ class BrowserManager:
             while time.time() - start < GENERATION_TIMEOUT:
                 stop_present = False
                 try:
-                    stop_present = bool(await self.page.evaluate(
+                    stop_present = bool(await asyncio.wait_for(self.page.evaluate(
                         'document.querySelector(\'button[aria-label="Stop generating"], button[data-testid="stop-button"]\') ? true : false'
-                    ))
+                    ), timeout=5.0))
                 except Exception:
                     pass
 
-                current_text = await read_last_assistant(self.page)
+                try:
+                    current_text = await asyncio.wait_for(read_last_assistant(self.page), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[{}] read_last_assistant таймаут 10s — bring_to_front + skip iter", self.profile_name)
+                    try:
+                        await asyncio.wait_for(self.page.bring_to_front(), timeout=3.0)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(interval)
+                    continue
                 if current_text != last_text:
                     last_text = current_text
                     seen_activity = True
@@ -513,9 +590,12 @@ class BrowserManager:
                     seen_activity = True
                     last_change = time.time()
 
-                # Периодический refresh CDP-эмуляции фокуса (раз в 5 секунд)
-                if time.time() - last_focus_refresh >= 5.0:
-                    await self._apply_focus_emulation()
+                # Периодический refresh CDP-эмуляции фокуса (раз в 1.5 секунды)
+                if time.time() - last_focus_refresh >= 1.5:
+                    try:
+                        await asyncio.wait_for(self._apply_focus_emulation(), timeout=4.0)
+                    except asyncio.TimeoutError:
+                        logger.warning("[{}] focus refresh таймаут 4s", self.profile_name)
                     last_focus_refresh = time.time()
 
                 # завершено: новый непустой текст, Stop исчез, текст стабилен ~2с

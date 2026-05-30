@@ -7,7 +7,7 @@ from proxy import bg_registry
 # Delimiter tool protocol (<<<verb>>> form — proven non-markdown). The model emits raw blocks; we convert to native
 # OpenAI tool_calls. No JSON escaping required from the model -> far more stable.
 # Format: <<<VERB attr="value">>>...<<<END>>>
-_HEADER_RE = re.compile(r"<<<(WRITE|EDIT|READ|BASH|GLOB|GREP|FETCH|TODO|TASK|ASK|MSG|BG_STATUS|BG_TAIL|BG_STOP|BG)([^>]*)>>>", re.IGNORECASE)
+_HEADER_RE = re.compile(r"<<<(WRITE|EDIT|READ|BASH|GLOB|GREP|FETCH|TODO|TASK|ASK|MSG|BGSTATUS|BGTAIL|BGSTOP|BG)([^>]*)>>>", re.IGNORECASE)
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 _END = "<<<END>>>"
 _THINKING_RE = re.compile(r'^(Thinking|Thought for \d+ seconds?)[\.\.\s]*', re.IGNORECASE)
@@ -24,7 +24,7 @@ class ResponseParser:
 
     def _needs_body(self, verb: str, attrs: dict) -> bool:
         """True if the block needs a closing <<<END>>>"""
-        return verb.upper() in ("WRITE", "EDIT", "BASH", "TODO", "TASK", "MSG")
+        return verb.upper() in ("WRITE", "EDIT", "BASH", "TODO", "TASK", "MSG", "BG")
 
     async def process_stream(self, chunk_stream: AsyncGenerator[str, None], model: str):
         async for chunk in chunk_stream:
@@ -91,15 +91,15 @@ class ResponseParser:
         if verb == "MSG":
             return self._content(self._strip_fence(body), model)
         if verb == "BG":
-            cmd = attrs.get("cmd", "")
+            cmd = self._strip_fence(body.strip())
             if not cmd:
-                return self._content("bg_error: missing cmd attribute", model)
+                return self._content("bg_error: missing cmd body", model)
             try:
                 res = bg_registry.start(cmd)
                 return self._content(f"bg_id={res['bg_id']} started: {res['cmd']}", model)
             except Exception as e:
                 return self._content(f"bg_error: {e}", model)
-        if verb == "BG_STATUS":
+        if verb == "BGSTATUS":
             bg_id = attrs.get("id", "")
             s = bg_registry.status(bg_id)
             if s is None:
@@ -108,7 +108,7 @@ class ResponseParser:
                 f"bg_id={s['bg_id']} alive={str(s['alive']).lower()} pid={s['pid']} exit_code={s['exit_code']} started_at={s['started_at']}",
                 model,
             )
-        if verb == "BG_TAIL":
+        if verb == "BGTAIL":
             bg_id = attrs.get("id", "")
             try:
                 n = int(attrs.get("lines", "50"))
@@ -118,7 +118,7 @@ class ResponseParser:
             if t is None:
                 return self._content("bg_error: not found", model)
             return self._content(f"```\n{t}\n```", model)
-        if verb == "BG_STOP":
+        if verb == "BGSTOP":
             bg_id = attrs.get("id", "")
             r = bg_registry.stop(bg_id)
             if r is None:

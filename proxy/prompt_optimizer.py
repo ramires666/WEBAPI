@@ -54,7 +54,7 @@ Assistant:
 <<<END>>>
 """
 
-PROXY_REMINDER = "\n\n[PROXY PROTOCOL] Respond ONLY by emitting ONE PROXY MARKUP block (<<<VERB ...>>>...<<<END>>>). No Canvas, no downloads, no file attachments, no Atlas widgets — any output outside markers is DISCARDED by the proxy."
+PROXY_REMINDER = "\n\n[PROXY PROTOCOL] Respond ONLY by emitting ONE PROXY MARKUP block (<<<VERB ...>>>...<<<END>>>). No Canvas, no downloads, no file attachments, no Atlas widgets — any output outside markers is DISCARDED by the proxy. BG-family verbs (BG, BGSTATUS, BGTAIL, BGSTOP) are proxy-side markers — the proxy holds the process registry and executes them. NEVER refuse with 'I can't access/check a process' — that is the proxy's job, not yours. For any user question about a bg_id, your entire reply MUST be the matching marker block, nothing else."
 
 def optimize_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Отфильтровывает ненужные инструменты и сильно урезает описания."""
