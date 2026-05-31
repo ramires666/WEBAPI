@@ -1,4 +1,8 @@
 import urllib.request, json, sys, time
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 TOOLS = [
     {"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}, "content": {"type": "string"}}}}},
@@ -15,7 +19,7 @@ def run(task: str, model: str = "Instant"):
         {"role": "user", "content": task}]}
     req = urllib.request.Request("http://127.0.0.1:8000/v1/chat/completions",
                                  data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
-    tc, txt = [], ""
+    acc, txt = {}, ""   # acc: index -> {"name","arguments"} (стримовая сборка)
     with urllib.request.urlopen(req, timeout=180) as r:
         for raw in r:
             s = raw.decode("utf-8", "replace").strip()
@@ -28,7 +32,14 @@ def run(task: str, model: str = "Instant"):
             if "content" in delta:
                 txt += delta["content"]
             if "tool_calls" in delta:
-                tc.append(delta["tool_calls"][0]["function"])
+                tc0 = delta["tool_calls"][0]
+                idx = tc0.get("index", 0)
+                fn = tc0.get("function", {})
+                if fn.get("name"):
+                    acc[idx] = {"name": fn["name"], "arguments": fn.get("arguments", "")}
+                elif idx in acc:
+                    acc[idx]["arguments"] += fn.get("arguments", "")
+    tc = [acc[i] for i in sorted(acc)]
     print("TASK:", task[:80])
     print("TOOL CALLS:", len(tc))
     for c in tc:
