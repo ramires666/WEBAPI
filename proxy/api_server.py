@@ -223,6 +223,7 @@ async def chat_completions(request: ChatCompletionRequest):
             full_reply = ""
             chunks_yielded = 0
             tool_call_count = 0
+            tool_acc = {}  # index -> {"name", "args"} для сборки stream tool_calls
             try:
                 # Используем выбранный браузер
                 chunk_stream = manager.send_prompt_and_stream(prompt_text, target_model, is_new_chat, chat_url)
@@ -240,16 +241,26 @@ async def chat_completions(request: ChatCompletionRequest):
                         if "content" in delta:
                             full_reply += delta["content"]
                         elif "tool_calls" in delta:
-                            # Сохраняем тул колл в историю как текст, чтобы знать, что мы вызывали
-                            tool_call_count += 1
-                            func = delta["tool_calls"][0]["function"]
-                            full_reply += f'\n```json\n{{"tool_call": {{"name": "{func["name"]}", "arguments": {func["arguments"]}}}}}\n```\n'
+                            # Стримовый tool_call: name+id только в первом чанке,
+                            # аргументы докапливаются по index в последующих.
+                            tc = delta["tool_calls"][0]
+                            idx = tc.get("index", 0)
+                            func = tc.get("function", {})
+                            if func.get("name"):
+                                tool_acc[idx] = {"name": func["name"], "args": func.get("arguments", "")}
+                                tool_call_count += 1
+                            elif idx in tool_acc:
+                                tool_acc[idx]["args"] += func.get("arguments", "")
                     except:
                         pass
 
                     chunks_yielded += 1
                     yield chunk_data
 
+                # Дособираем stream tool_calls в текст истории (после полного стрима)
+                for _idx in sorted(tool_acc):
+                    _tc = tool_acc[_idx]
+                    full_reply += f'\n```json\n{{"tool_call": {{"name": "{_tc["name"]}", "arguments": {_tc["args"]}}}}}\n```\n'
                 logger.info("📤 SSE: yielded={} chunks, tool_calls={}", chunks_yielded, tool_call_count)
                 logger.info("🔚 СТАРТ post-stream (get_current_url + upsert)")
                 _t = time.perf_counter()

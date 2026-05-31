@@ -17,6 +17,7 @@ from config import (
 from browser.cdp_native import (
     send_key, human_type, insert_text_fast, click_element, find_element,
     scroll_bottom, human_scroll, current_url, read_last_assistant,
+    inject_stream_observer, read_stream_buffer,
 )
 from browser.file_extractor import click_download_buttons, collect_files
 
@@ -456,12 +457,10 @@ class BrowserManager:
             logger.info("[{}] Ввод промпта (длина {} символов)...", self.profile_name, len(prompt_text))
             await click_element(textarea)
             await asyncio.sleep(0.4)
-            if len(prompt_text) > 2000:
-                logger.info("[{}] Длинный текст — нативная вставка insert_text...", self.profile_name)
-                await insert_text_fast(self.page, prompt_text)
-                await asyncio.sleep(0.8)
-            else:
-                await human_type(textarea, prompt_text)
+            # Всегда нативная вставка (insert_text) — human_type слишком медленный для инжектов.
+            logger.info("[{}] Нативная вставка insert_text ({} симв)...", self.profile_name, len(prompt_text))
+            await insert_text_fast(self.page, prompt_text)
+            await asyncio.sleep(0.5)
 
             await asyncio.sleep(0.8)
             send_btn = await find_element(self.page, SEND_SELECTOR, timeout=3)
@@ -516,7 +515,8 @@ class BrowserManager:
                 logger.debug("[{}] verify-submit failed: {}", self.profile_name, ve)
 
             logger.info("[{}] Запрос отправлен. Ждём генерацию...", self.profile_name)
-            interval = 0.4
+            await inject_stream_observer(self.page)  # обсервер: дешёвое чтение window.__pxFull
+            interval = 0.05  # Быстрый поллинг (чтение копеечное — обсервер уже посчитал)
             start = time.time()
             t_submit = time.perf_counter()
             t_first_chunk = None
@@ -532,8 +532,9 @@ class BrowserManager:
                 baseline = ""
             last_text = baseline
             prev_text = baseline
-            emitted = ""        # часть НОВОГО ответа, уже отданная клиенту
-            started = False     # новый ответ начал появляться
+            # emitted: префикс НОВОГО ответа, уже отданный клиенту (стрим по 2 чтениям)
+            emitted = ""
+            started = False
 
             def _cpl(a, b):
                 n = min(len(a), len(b))
@@ -553,9 +554,9 @@ class BrowserManager:
                     pass
 
                 try:
-                    current_text = await asyncio.wait_for(read_last_assistant(self.page), timeout=10.0)
+                    current_text = await asyncio.wait_for(read_stream_buffer(self.page), timeout=10.0)
                 except asyncio.TimeoutError:
-                    logger.warning("[{}] read_last_assistant таймаут 10s — bring_to_front + skip iter", self.profile_name)
+                    logger.warning("[{}] read_stream_buffer таймаут 10s — bring_to_front + skip iter", self.profile_name)
                     try:
                         await asyncio.wait_for(self.page.bring_to_front(), timeout=3.0)
                     except Exception:
@@ -570,11 +571,12 @@ class BrowserManager:
                 # новый ответ начался (отличается от того, что было до отправки)
                 if not started and current_text and current_text != baseline:
                     started = True
-                    prev_text = current_text
+                    # prev_text оставляем = baseline → первый _cpl даст 0,
+                    # первый чанк подтвердится ВТОРЫМ чтением (анти-транзиент).
 
-                # Стабильный стриминг: отдаём только префикс, совпавший в ДВУХ
-                # подряд чтениях DOM (исключает искажения от ре-рендеров), и только
-                # как чистое продолжение уже отданного.
+                # СТАБИЛЬНЫЙ СТРИМИНГ: отдаём только префикс, совпавший в ДВУХ
+                # подряд чтениях DOM (отсекает транзиентные ре-рендеры markdown,
+                # плющащие маркер-строки) и только как чистое продолжение emitted.
                 if started:
                     sp = _cpl(prev_text, current_text)
                     prev_text = current_text
@@ -642,18 +644,27 @@ class BrowserManager:
                 except Exception as de:
                     logger.error("[{}] Не удалось снять DOM dump: {}", self.profile_name, de)
 
-            # Досыл хвоста: гарантируем, что отдан ПОЛНЫЙ чистый финальный текст
-            # (всё, что не успели отдать стабильным стримингом).
-            final_text = last_text if last_text != baseline else ""
+            # Досыл хвоста: берём АВТОРИТЕТНЫЙ финал свежим read_last_assistant
+            # (обсервер мог отстать на одну мутацию на самом конце).
+            try:
+                authoritative = await asyncio.wait_for(read_last_assistant(self.page), timeout=10.0)
+            except Exception:
+                authoritative = last_text
+            final_text = authoritative if (authoritative and authoritative != baseline) else (last_text if last_text != baseline else "")
             logger.info("[{}] 📝 FINAL_TEXT: len={}, has_write={}, has_end={}, has_edit={}, head={!r}",
                         self.profile_name, len(final_text),
                         "<<<WRITE" in final_text, "<<<END>>>" in final_text, "<<<EDIT" in final_text,
                         final_text[:200])
             if final_text:
+                # Инвариант: emitted — точный префикс финала. Если транзиент его
+                # нарушил — _cpl-фоллбэк (досылаем с точки расхождения).
                 if final_text.startswith(emitted):
                     tail = final_text[len(emitted):]
                 else:
-                    tail = final_text[_cpl(emitted, final_text):]
+                    cp = _cpl(emitted, final_text)
+                    logger.warning("[{}] ⚠️ emitted разошёлся с финалом (cp={}, emitted={}) — _cpl-фоллбэк",
+                                   self.profile_name, cp, len(emitted))
+                    tail = final_text[cp:]
                 if tail:
                     logger.info("[{}] 📤 yield tail: len={}", self.profile_name, len(tail))
                     yield tail

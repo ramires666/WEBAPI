@@ -99,6 +99,57 @@ _BLOCK_CLOSE = re.compile(r"</(p|div|pre|li|ul|ol|h[1-6]|tr|table|blockquote|sec
 _TAG = re.compile(r"<[^>]+>")
 
 
+_RECONSTRUCT_FN = """() => {
+    const m = document.querySelectorAll('div[data-message-author-role="assistant"]');
+    if (!m.length) return "";
+    const last = m[m.length-1];
+    const md = last.querySelector(".markdown");
+    if (!md) return last.innerText || "";
+
+    let result = "";
+    for (let node of md.childNodes) {
+        // Пропускаем Thinking-блоки (DETAILS/SUMMARY) и кнопки
+        if (node.nodeType === 1) {
+            const tag = node.tagName;
+            if (tag === 'DETAILS' || tag === 'SUMMARY' || tag === 'BUTTON') continue;
+            // Пропускаем div-ы с классами связанными с thinking
+            if (tag === 'DIV' && node.className &&
+                (node.className.includes('thinking') || node.className.includes('thought'))) continue;
+        }
+        if (node.nodeType === 1 && node.tagName === 'PRE') {
+            const codeEl = node.querySelector('code');
+            const code = (codeEl ? codeEl.innerText : node.innerText) || node.textContent || "";
+            result += code + "\\n";
+        } else {
+            const t = (node.nodeType === 3 ? node.textContent : (node.innerText || node.textContent)) || "";
+            if (t) result += t + "\\n";
+        }
+    }
+    return result.trim();
+}"""
+
+
+def _clean_text(txt: str) -> str:
+    """Применяет одинаковые фильтры к текстам из read_last_assistant и read_stream_buffer.
+
+    Фильтрация:
+    - Обрезаем всё от маркера [Canvas] до конца
+    - Стрипуем Thinking-префикс
+    - Убираем битые цитатные якоря *]()
+    - Схлопываем 3+ идущих подряд переносов
+    - Финальный strip()
+    """
+    # Стрип Canvas — обрезаем ВСЁ от маркера [Canvas] до конца
+    canvas_idx = txt.find("[Canvas]")
+    if canvas_idx != -1:
+        txt = txt[:canvas_idx]
+    # Стрип Thinking-префикса (если просочился через DOM)
+    txt = re.sub(r'^(Thinking|Thought for \d+ seconds?)[\.\s]*', '', txt, flags=re.IGNORECASE)
+    txt = re.sub(r'\*\]\(\)', '', txt)          # битый цитатный якорь ChatGPT
+    txt = re.sub(r'\n{3,}', '\n\n', txt)        # схлопнуть пустые строки от вырезанного
+    return txt.strip()
+
+
 def html_to_text(html: str) -> str:
     """Грубая конвертация HTML→текст с сохранением переносов (без JS innerText)."""
     if not html:
@@ -122,47 +173,42 @@ async def read_last_assistant(page) -> str:
     - Стрипает [Canvas] маркер и весь хвост после него
     - Стрипает битые цитатные якоря *]()
     """
-    js_code = '''
-    (() => {
-        const m = document.querySelectorAll('div[data-message-author-role="assistant"]');
-        if (!m.length) return "";
-        const last = m[m.length-1];
-        const md = last.querySelector(".markdown");
-        if (!md) return last.innerText || "";
-        
-        let result = "";
-        for (let node of md.childNodes) {
-            // Пропускаем Thinking-блоки (DETAILS/SUMMARY) и кнопки
-            if (node.nodeType === 1) {
-                const tag = node.tagName;
-                if (tag === 'DETAILS' || tag === 'SUMMARY' || tag === 'BUTTON') continue;
-                // Пропускаем div-ы с классами связанными с thinking
-                if (tag === 'DIV' && node.className && 
-                    (node.className.includes('thinking') || node.className.includes('thought'))) continue;
-            }
-            if (node.nodeType === 1 && node.tagName === 'PRE') {
-                const codeEl = node.querySelector('code');
-                const code = (codeEl ? codeEl.innerText : node.innerText) || node.textContent || "";
-                result += code + "\\n";
-            } else {
-                const t = (node.nodeType === 3 ? node.textContent : (node.innerText || node.textContent)) || "";
-                if (t) result += t + "\\n";
-            }
-        }
-        return result.trim();
-    })()
+    try:
+        txt = await page.evaluate(f"({_RECONSTRUCT_FN})()") or ""
+        return _clean_text(txt)
+    except Exception:
+        return ""
+
+
+async def inject_stream_observer(page) -> None:
+    """Инъектит пассивный MutationObserver: на каждую мутацию пересобирает чистый
+    текст последнего assistant-сообщения в window.__pxFull. Идемпотентно
+    (повторный вызов не плодит обсерверы). Чтение становится копеечным."""
+    js = f'''
+    (() => {{
+        try {{
+            window.__pxReconstruct = {_RECONSTRUCT_FN};
+            window.__pxFull = window.__pxReconstruct();
+            if (window.__pxObs) return;
+            const root = document.querySelector('main') || document.body;
+            window.__pxObs = new MutationObserver(() => {{
+                try {{ window.__pxFull = window.__pxReconstruct(); }} catch (e) {{}}
+            }});
+            window.__pxObs.observe(root, {{childList: true, subtree: true, characterData: true}});
+        }} catch (e) {{}}
+    }})()
     '''
     try:
-        txt = await page.evaluate(js_code) or ""
-        # Стрип Canvas — обрезаем ВСЁ от маркера [Canvas] до конца
-        # (после маркера обычно идёт дубль кода в ```-фенсе)
-        canvas_idx = txt.find("[Canvas]")
-        if canvas_idx != -1:
-            txt = txt[:canvas_idx]
-        # Стрип Thinking-префикса (если просочился через DOM)
-        txt = re.sub(r'^(Thinking|Thought for \d+ seconds?)[\.\s]*', '', txt, flags=re.IGNORECASE)
-        txt = re.sub(r'\*\]\(\)', '', txt)          # битый цитатный якорь ChatGPT
-        txt = re.sub(r'\n{3,}', '\n\n', txt)        # схлопнуть пустые строки от вырезанного
-        return txt.strip()
+        await page.evaluate(js)
+    except Exception as e:
+        logger.debug("inject_stream_observer failed: {}", e)
+
+
+async def read_stream_buffer(page) -> str:
+    """Дешёвое чтение предрассчитанного обсервером текста (window.__pxFull).
+    Без обхода DOM в Python. Те же фильтры, что и read_last_assistant."""
+    try:
+        txt = await page.evaluate("window.__pxFull || ''") or ""
+        return _clean_text(txt)
     except Exception:
         return ""
