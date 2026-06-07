@@ -1,4 +1,5 @@
 import json
+import copy
 from typing import List, Dict, Any
 
 ALLOWED_TOOLS = {
@@ -66,7 +67,6 @@ def optimize_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             name = t.get("function", {}).get("name")
             if name in ALLOWED_TOOLS:
                 # Копируем структуру, чтобы не менять оригинал
-                import copy
                 t_copy = copy.deepcopy(t)
                 
                 # Обрезаем описание самой функции

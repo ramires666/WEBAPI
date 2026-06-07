@@ -1,75 +1,131 @@
-# ChatGPT Automation (nodriver)
+# ChatGPT API Proxy
 
-Автоматическая отправка промпта в ChatGPT и сбор ответа через браузер Chrome с использованием `nodriver`.
-
-## Архитектура
-
-Скрипт использует **копию профиля Chrome** для сохранения авторизации:
-
-1. Из `%LOCALAPPDATA%\Google\Chrome\User Data` копируются:
-   - `Local State` — файл с ключами шифрования куков (DPAPI)
-   - `Profile 2` — папка профиля с cookies и сессией
-2. Копия хранится в `chrome_work_profile/` внутри проекта
-3. Chrome запускается через nodriver с этим рабочим профилем
-
-## Требования
-
-- **Windows** (DPAPI привязан к текущему пользователю)
-- **Python 3.10+** (venv: `.venv\Scripts\python.exe`)
-- **Google Chrome** установлен
-- Авторизация в ChatGPT в **Profile 2** оригинального Chrome
+Локальный прокси: превращает браузерный ChatGPT в OpenAI-совместимый API. Клиент — Kilo Code (IDE-расширение). Браузером управляет нативный CDP без JS-инъекций, что выглядит как живой человек.
 
 ## Быстрый старт
 
-### 1. Установка зависимостей
+```powershell
+# Зависимости
+pip install -r requirements.txt
 
-```cmd
-.venv\Scripts\pip.exe install -r requirements.txt
+# Запуск напрямую
+python run.py
+
+# API доступен на http://0.0.0.0:47821/v1
 ```
 
-### 2. Первый запуск (если нет рабочего профиля)
+## Структура
 
-Скрипт автоматически скопирует профиль при первом запуске.
-
-**Важно:** Перед запуском закройте ВСЕ окна Chrome!
-
-```cmd
-taskkill /F /IM chrome.exe
-.venv\Scripts\python.exe main.py
+```
+run.py                      — точка входа (uvicorn)
+config.py                   — все настройки (env-override)
+browser/
+  browser_manager.py        — пул вкладок, отправка/стрим, show/hide
+  cdp_native.py             — нативный ввод + read_last_assistant
+  file_extractor.py         — скачивание файлов из чата
+proxy/
+  api_server.py             — FastAPI, /v1/chat/completions, admin endpoints
+  conversation_store.py     — SQLite-матчинг диалогов по user-хешам
+  prompt_optimizer.py       — обрезка системного промпта Kilo (~12k→1.5k)
+  response_parser.py        — стрим-парсер делимитер-блоков → нативный tool_calls
+  context_summarizer.py     — авто-суммаризация длинных контекстов
+scripts/
+  install-service.ps1       — регистрация Windows-сервиса через NSSM
+  show-browsers.ps1         — вывести браузеры на экран (для ручного логина)
+  hide-browsers.ps1         — спрятать браузеры за экран
+  login.bat                 — открыть профиль для логина
+  run_with_logs.ps1         — запуск с выводом логов
+  replay.py                 — реплей реального request_dump для тестов
+docs/
+  service-setup.md          — полная инструкция по сервису
+  custom_instructions.txt   — Custom Instructions для ChatGPT-аккаунта
 ```
 
-### 3. Если сессия истекла (кнопка Login)
+## Конфигурация (.env или env-переменные)
 
-Запустите `login_chrome.bat`, войдите в ChatGPT вручную, **полностью закройте браузер**, затем запустите `main.py` снова.
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `BIND_HOST` | `0.0.0.0` | Адрес биндинга |
+| `BIND_PORT` | `47821` | Порт |
+| `API_KEY` | `` (пусто) | Bearer-токен (пусто = без авторизации) |
+| `PROFILES` | `Profile 2` | Профили Chrome через запятую |
+| `PROFILES_DIR` | `W:\_python\APIPROXY\profiles` | Источник профилей |
+| `WORK_DIR` | `W:\_python\APIPROXY\work` | Рабочие копии профилей |
+| `TEMP_DOWNLOADS` | `W:\_python\APIPROXY\temp_downloads` | Папка загрузок |
 
-Если хотите полностью обновить профиль:
-```cmd
-rmdir /s /q chrome_work_profile
-.venv\Scripts\python.exe main.py
+## Браузеры: show/hide
+
+Браузеры стартуют off-screen (`-32000,-32000`) — не мешают, рендерят нормально:
+
+```powershell
+.\scripts\show-browsers.ps1   # браузеры выезжают на экран — логинишься руками
+.\scripts\hide-browsers.ps1   # уходят обратно
 ```
 
-## Файлы проекта
+Или через API (без авторизации):
+```
+POST http://localhost:47821/admin/browsers/show
+POST http://localhost:47821/admin/browsers/hide
+```
 
-| Файл | Описание |
-|---|---|
-| `main.py` | Основной скрипт автоматизации |
-| `login_chrome.bat` | Ручной вход в Chrome с рабочим профилем |
-| `requirements.txt` | Зависимости Python |
-| `result.txt` | Последний ответ ChatGPT (создаётся автоматически) |
-| `chrome_work_profile/` | Рабочая копия профиля Chrome |
+## Как сервис (Windows)
 
-## Как это работает
+```powershell
+# От администратора — один раз:
+.\scripts\install-service.ps1
+Start-Service apiproxy
 
-1. Копирует `Local State` + `Profile 2` → `chrome_work_profile/`
-2. Запускает Chrome (видимое окно, не headless)
-3. Переходит на `chatgpt.com`, проверяет авторизацию
-4. Находит поле ввода, печатает промпт посимвольно (имитация человека)
-5. Отправляет промпт, ждёт завершения генерации (DOM-polling)
-6. Извлекает текст последнего ответа assistant
-7. Сохраняет в `result.txt`, закрывает браузер
+# Управление:
+Stop-Service apiproxy
+Restart-Service apiproxy
+Get-Service apiproxy
+```
 
-## Устранение проблем
+Логи: `logs/proxy.log` (ротация по 10 МБ, 5 файлов).
 
-- **«Сессия недействительна»** → Запустите `login_chrome.bat`, войдите, закройте браузер
-- **Chrome не запускается** → Убейте все процессы: `taskkill /F /IM chrome.exe`
-- **Профиль повреждён** → Удалите `chrome_work_profile/` и запустите заново
+## Настройка Kilo Code
+
+```
+Base URL: http://<IP-машины>:47821/v1
+Model:    gpt-4o   (или любой — прокси маршрутизирует на ChatGPT)
+```
+
+Если `API_KEY` задан — добавить в Kilo: `Authorization: Bearer <ключ>`.
+
+## Custom Instructions (обязательно!)
+
+Протокол работы с файлами (`<<<WRITE>>>`, `<<<EDIT>>>` и т.д.) живёт в **Custom Instructions ChatGPT-аккаунта** (`Settings → Personalization → How would you like ChatGPT to respond`).
+
+Актуальный текст: [`docs/custom_instructions.txt`](docs/custom_instructions.txt)
+
+Без этого модель не будет выдавать делимитер-блоки — tool_calls не появятся.
+
+## Тестирование
+
+```powershell
+# Реплей реального дампа запроса (без живого Kilo):
+python scripts/replay.py temp/request_dump_XXXXXXX.json
+
+# Живой тест: запустить Kilo, смотреть logs/proxy.log
+```
+
+## Делимитер-протокол (кратко)
+
+Модель пишет не JSON, а блоки:
+
+```
+<<<WRITE path="src/main.py">>>
+... содержимое файла ...
+<<<END>>>
+
+<<<EDIT path="config.py">>>
+<<<OLD>>>старый фрагмент<<<NEW>>>новый фрагмент<<<END>>>
+
+<<<BASH>>>команда<<<END>>>
+<<<READ path="file.py">>>
+<<<GLOB pattern="**/*.ts">>>
+<<<GREP pattern="TODO" path="src/">>>
+<<<MSG>>>обычный текст ответа<<<END>>>
+```
+
+`response_parser` переводит это в нативный OpenAI `tool_calls` формат.

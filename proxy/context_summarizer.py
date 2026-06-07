@@ -91,17 +91,3 @@ def build_context_injection(summary_text: str) -> str:
 """
 
 
-def get_latest_summary(client_id: str) -> str | None:
-    """Возвращает текст последнего саммари для данного клиента, или None."""
-    ensure_summary_dir()
-    prefix = f"summary_{client_id}_"
-    files = [
-        f for f in os.listdir(SUMMARY_DIR)
-        if f.startswith(prefix) and f.endswith(".md")
-    ]
-    if not files:
-        return None
-    latest = sorted(files)[-1]
-    path = os.path.join(SUMMARY_DIR, latest)
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()

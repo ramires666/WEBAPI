@@ -75,3 +75,15 @@ class BrowserPool:
         self._save_idx()
         logger.info("[pool] Новый чат → {} (idx={})", name, self._idx)
         return name, self.managers[name]
+
+    async def show_all(self):
+        """Вывести все активные браузеры на экран."""
+        for name, mgr in self.managers.items():
+            if name not in self.unavailable:
+                await mgr.show_window()
+
+    async def hide_all(self):
+        """Убрать все активные браузеры за экран."""
+        for name, mgr in self.managers.items():
+            if name not in self.unavailable:
+                await mgr.hide_window()

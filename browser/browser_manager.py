@@ -26,14 +26,6 @@ warnings.filterwarnings('ignore', category=ResourceWarning)
 import re as _re_bm
 
 
-def _common_prefix_len(a: str, b: str) -> int:
-    n = min(len(a), len(b))
-    i = 0
-    while i < n and a[i] == b[i]:
-        i += 1
-    return i
-
-
 _WE_HEADER = _re_bm.compile(r'<<<(?:WRITE|EDIT)\b[^>]*>>>', _re_bm.IGNORECASE)
 
 _LIVE_STATUS_RE = _re_bm.compile(
@@ -176,9 +168,8 @@ class BrowserManager:
         dst = os.path.join(self.work_dir, self.profile_name)
         if not os.path.exists(src):
             raise FileNotFoundError(f"[{self.profile_name}] Profile not found: {src}")
-        if not os.path.exists(dst):
-            logger.info("[{}] Копирую профиль {} → {}", self.profile_name, src, dst)
-            shutil.copytree(src, dst, dirs_exist_ok=True)
+        logger.info("[{}] Синк профиля {} → {}", self.profile_name, src, dst)
+        shutil.copytree(src, dst, dirs_exist_ok=True)
 
     async def _apply_focus_emulation(self):
         """Применить CDP-эмуляцию фокуса + JS-шим visibility/hasFocus.
@@ -256,6 +247,40 @@ class BrowserManager:
             logger.info("[{}] Останавливаю браузер...", self.profile_name)
             self.browser.stop()
             logger.info("[{}] Браузер остановлен.", self.profile_name)
+
+    async def show_window(self):
+        """Переместить окно браузера на экран (100,100) для ручного входа/просмотра."""
+        if not self.page:
+            return
+        try:
+            window_id, _ = await self.page.send(cdp_browser.get_window_for_target())
+            await self.page.send(cdp_browser.set_window_bounds(
+                window_id=window_id,
+                bounds=cdp_browser.Bounds(
+                    left=100, top=100, width=1280, height=900,
+                    window_state=cdp_browser.WindowState.NORMAL,
+                )
+            ))
+            logger.info("[{}] Окно выведено на экран", self.profile_name)
+        except Exception as e:
+            logger.warning("[{}] show_window failed: {}", self.profile_name, e)
+
+    async def hide_window(self):
+        """Убрать окно браузера за экран (-32000,-32000)."""
+        if not self.page:
+            return
+        try:
+            window_id, _ = await self.page.send(cdp_browser.get_window_for_target())
+            await self.page.send(cdp_browser.set_window_bounds(
+                window_id=window_id,
+                bounds=cdp_browser.Bounds(
+                    left=-32000, top=-32000, width=1280, height=900,
+                    window_state=cdp_browser.WindowState.NORMAL,
+                )
+            ))
+            logger.info("[{}] Окно убрано off-screen", self.profile_name)
+        except Exception as e:
+            logger.warning("[{}] hide_window failed: {}", self.profile_name, e)
 
     async def get_current_url(self) -> str:
         return current_url(self.page)
@@ -657,10 +682,36 @@ class BrowserManager:
 
                 # завершено: новый непустой текст, Stop исчез, текст стабилен ~2с
                 if last_text and last_text != baseline and not stop_present and (time.time() - last_change) >= 1.5:
-                    # Defensive: модель иногда шлёт короткое "ОК" → потом отдельное сообщение
-                    # с tool-блоком. Подождём ещё 3с и перечитаем last_assistant; если текст
-                    # изменился (новое сообщение) — продолжаем цикл.
-                    await asyncio.sleep(1.5)
+                    # Poll 0.5с: ловим зазор между "ОК" и вторым tool-call сообщением.
+                    # Фиксированный sleep(N) ненадёжен — зазор может быть > N.
+                    # Poll выходит немедленно при любой активности (stop вернулся / текст изменился).
+                    _poll_done = True
+                    _poll_end = time.time() + 0.5
+                    while time.time() < _poll_end:
+                        await asyncio.sleep(0.1)
+                        try:
+                            _sp2 = bool(await asyncio.wait_for(self.page.evaluate(
+                                'document.querySelector(\'button[aria-label="Stop generating"], button[data-testid="stop-button"]\') ? true : false'
+                            ), timeout=3.0))
+                        except Exception:
+                            _sp2 = False
+                        if _sp2:
+                            _poll_done = False
+                            seen_activity = True
+                            last_change = time.time()
+                            break
+                        try:
+                            _new = await asyncio.wait_for(read_stream_buffer(self.page), timeout=5.0)
+                        except Exception:
+                            _new = last_text
+                        if _new != last_text:
+                            last_text = _new
+                            last_change = time.time()
+                            seen_activity = True
+                            _poll_done = False
+                            break
+                    if not _poll_done:
+                        continue
                     post_text = await read_last_assistant(self.page)
                     if post_text and post_text != last_text:
                         logger.info("[{}] После 'завершения' появился новый текст — продолжаем", self.profile_name)
@@ -733,14 +784,7 @@ class BrowserManager:
                 if tail:
                     yield tail
             t_post_start = time.perf_counter()
-            t_scroll_start = time.perf_counter()
-            try:
-                await asyncio.wait_for(scroll_bottom(self.page), timeout=2.0)
-            except asyncio.TimeoutError:
-                logger.warning("[{}] scroll_bottom таймаут 2s — пропускаем", self.profile_name)
-            except Exception as e:
-                logger.warning("[{}] scroll_bottom ошибка: {}", self.profile_name, e)
-            logger.info("[{}] ⏱ scroll_bottom: {:.2f}s", self.profile_name, time.perf_counter() - t_scroll_start)
+            # click_download_buttons + collect_files синхронно — blob нужен клиенту, и быстро при 0 кликах.
             t_click_start = time.perf_counter()
             clicked = await click_download_buttons(self.page)
             logger.info("[{}] ⏱ click_download_buttons: {:.2f}s, clicked={}",
@@ -754,12 +798,20 @@ class BrowserManager:
             if blob:
                 yield blob
 
-            t_popup_start = time.perf_counter()
-            try:
-                await asyncio.wait_for(self._handle_personality_popup(), timeout=0.3)
-            except asyncio.TimeoutError:
-                logger.warning("[{}] _handle_personality_popup таймаут 0.3s — пропускаем", self.profile_name)
-            logger.info("[{}] ⏱ popup: {:.2f}s", self.profile_name, time.perf_counter() - t_popup_start)
+            # scroll_bottom + popup — в фоне, чтобы генератор вернулся немедленно:
+            # клиент получит [DONE] без ожидания браузерной косметики.
+            _self = self
+            async def _bg_post():
+                try:
+                    await asyncio.wait_for(scroll_bottom(_self.page), timeout=2.0)
+                    logger.info("[{}] ⏱ bg scroll_bottom done", _self.profile_name)
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(_self._handle_personality_popup(), timeout=0.3)
+                except Exception:
+                    pass
+            asyncio.create_task(_bg_post())
 
             # Сводка таймингов
             t_end = time.perf_counter()

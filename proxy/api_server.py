@@ -1,23 +1,32 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
-import uvicorn
 import json
 import asyncio
 import os
 import time
 import glob
+import re
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from browser.browser_pool import BrowserPool
 from proxy.conversation_store import ConversationStore, client_fingerprint
 from proxy.token_counter import estimate_messages_tokens
 from proxy.context_summarizer import build_summary_prompt, save_summary, build_context_injection
-from config import AUTO_SUMMARY_ENABLED, TOKEN_LIMIT, PROFILES, PROFILES_DIR, WORK_DIR, DUMP_MAX_AGE_DAYS
+from config import AUTO_SUMMARY_ENABLED, TOKEN_LIMIT, PROFILES, PROFILES_DIR, WORK_DIR, DUMP_MAX_AGE_DAYS, API_KEY
 from loguru import logger
 
 app = FastAPI(title="ChatGPT API Proxy (Human-Mimic Edition)")
 
-DUMP_DIR = r"W:\_python\APIPROXY\temp"
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+_bearer = HTTPBearer(auto_error=False)
+
+async def _check_auth(creds: HTTPAuthorizationCredentials = Depends(_bearer)):
+    if API_KEY and (not creds or creds.credentials != API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+DUMP_DIR = os.getenv("DUMP_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp"))
 os.makedirs(DUMP_DIR, exist_ok=True)
 
 def dump_request(data: dict):
@@ -80,8 +89,7 @@ def format_delta_prompt(delta_messages: List[ChatMessage], tools: Optional[List[
         content = msg.content
         if isinstance(content, list):
             content = " ".join([p.get("text", "") for p in content if p.get("type") == "text"])
-            
-        import re
+
         content = re.sub(r'<environment_details>.*?</environment_details>', '', content, flags=re.DOTALL).strip()
         
         if msg.role == "system":
@@ -119,7 +127,7 @@ async def startup_event():
 async def shutdown_event():
     await browser_pool.stop_all()
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(_check_auth)])
 async def list_models():
     return {
         "object": "list",
@@ -128,6 +136,18 @@ async def list_models():
             {"id": "Thinking", "object": "model", "created": 1715367049, "owned_by": "system"}
         ]
     }
+
+@app.post("/admin/browsers/show")
+async def admin_show_browsers():
+    """Вывести все браузеры на экран (для ручного логина)."""
+    await browser_pool.show_all()
+    return {"status": "ok", "action": "show"}
+
+@app.post("/admin/browsers/hide")
+async def admin_hide_browsers():
+    """Убрать все браузеры за экран."""
+    await browser_pool.hide_all()
+    return {"status": "ok", "action": "hide"}
 
 TITLE_MARKERS = (
     "you are a title generator",
@@ -161,7 +181,7 @@ def make_local_title(messages: List[ChatMessage]) -> str:
     return title[:1].upper() + title[1:]
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(_check_auth)])
 async def chat_completions(request: ChatCompletionRequest):
     # Дампим полный запрос для анализа
     dump_request(request.model_dump())
@@ -248,13 +268,12 @@ async def chat_completions(request: ChatCompletionRequest):
     # Смысловой текст последнего user-сообщения — его ВПЕЧАТАЕМ (человеко-ввод);
     # систему/контекст/результаты тулзов — вставим пастой (insert_text).
     typed_segment = ""
-    import re as _re_ts
     for _m in delta_messages:
         if _m.role == "user":
             _c = _m.content
             if isinstance(_c, list):
                 _c = " ".join(p.get("text", "") for p in _c if isinstance(p, dict) and p.get("type") == "text")
-            _c = _re_ts.sub(r'<environment_details>.*?</environment_details>', '', _c or "", flags=_re_ts.DOTALL).strip()
+            _c = re.sub(r'<environment_details>.*?</environment_details>', '', _c or "", flags=re.DOTALL).strip()
             if _c:
                 typed_segment = _c
 
