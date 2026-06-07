@@ -100,31 +100,107 @@ _TAG = re.compile(r"<[^>]+>")
 
 
 _RECONSTRUCT_FN = """() => {
-    const m = document.querySelectorAll('div[data-message-author-role="assistant"]');
-    if (!m.length) return "";
-    const last = m[m.length-1];
-    const md = last.querySelector(".markdown");
-    if (!md) return last.innerText || "";
+    const sel = document.querySelectorAll('div[data-message-author-role="assistant"]');
+    if (!sel.length) return "";
+    const last = sel[sel.length-1];
+    const root = last.querySelector(".markdown") || last;
 
-    let result = "";
-    for (let node of md.childNodes) {
-        // Пропускаем Thinking-блоки (DETAILS/SUMMARY) и кнопки
-        if (node.nodeType === 1) {
-            const tag = node.tagName;
-            if (tag === 'DETAILS' || tag === 'SUMMARY' || tag === 'BUTTON') continue;
-            // Пропускаем div-ы с классами связанными с thinking
-            if (tag === 'DIV' && node.className &&
-                (node.className.includes('thinking') || node.className.includes('thought'))) continue;
-        }
-        if (node.nodeType === 1 && node.tagName === 'PRE') {
-            const codeEl = node.querySelector('code');
-            const code = (codeEl ? codeEl.innerText : node.innerText) || node.textContent || "";
-            result += code + "\\n";
-        } else {
-            const t = (node.nodeType === 3 ? node.textContent : (node.innerText || node.textContent)) || "";
-            if (t) result += t + "\\n";
-        }
-    }
+    const skip = (el) => {
+        const t = el.tagName;
+        if (t === 'BUTTON' || t === 'DETAILS' || t === 'SUMMARY') return true;
+        const cn = (typeof el.className === 'string') ? el.className : '';
+        if (cn.indexOf('thinking') !== -1 || cn.indexOf('thought') !== -1) return true;
+        return false;
+    };
+
+    const inline = (node) => {
+        let s = "";
+        node.childNodes.forEach((ch) => {
+            if (ch.nodeType === 3) { s += ch.textContent; return; }
+            if (ch.nodeType !== 1) return;
+            if (skip(ch)) return;
+            const t = ch.tagName;
+            if (t === 'BR') { s += "\\n"; return; }
+            if (t === 'STRONG' || t === 'B') { s += "**" + inline(ch) + "**"; return; }
+            if (t === 'EM' || t === 'I') { s += "*" + inline(ch) + "*"; return; }
+            if (t === 'DEL' || t === 'S') { s += "~~" + inline(ch) + "~~"; return; }
+            if (t === 'CODE') { s += "`" + (ch.textContent || "") + "`"; return; }
+            if (t === 'A') {
+                const href = ch.getAttribute('href') || "";
+                const txt = inline(ch);
+                if (/^https?:\\/\\//i.test(href)) { s += "[" + txt + "](" + href + ")"; }
+                else { s += txt; }
+                return;
+            }
+            s += inline(ch);
+        });
+        return s;
+    };
+
+    const listItems = (listEl, depth, ordered) => {
+        let out = "", i = 1;
+        listEl.childNodes.forEach((li) => {
+            if (li.nodeType !== 1 || li.tagName !== 'LI') return;
+            let head = "", nested = "";
+            li.childNodes.forEach((c) => {
+                if (c.nodeType === 1 && (c.tagName === 'UL' || c.tagName === 'OL')) {
+                    nested += listItems(c, depth + 1, c.tagName === 'OL');
+                } else if (c.nodeType === 3) {
+                    head += c.textContent;
+                } else if (c.nodeType === 1) {
+                    if (!skip(c)) head += inline(c);
+                }
+            });
+            const pad = "  ".repeat(depth);
+            const marker = ordered ? (i + ". ") : "- ";
+            out += pad + marker + head.trim() + "\\n" + nested;
+            i++;
+        });
+        return out;
+    };
+
+    const block = (node, depth) => {
+        let out = "";
+        node.childNodes.forEach((ch) => {
+            if (ch.nodeType === 3) {
+                const tx = ch.textContent;
+                if (tx && tx.trim()) out += tx.trim() + "\\n\\n";
+                return;
+            }
+            if (ch.nodeType !== 1) return;
+            if (skip(ch)) return;
+            const t = ch.tagName;
+            if (/^H[1-6]$/.test(t)) {
+                const lvl = parseInt(t.charAt(1), 10);
+                out += "#".repeat(lvl) + " " + inline(ch).trim() + "\\n\\n";
+            } else if (t === 'P') {
+                const tx = inline(ch).trim();
+                if (tx) out += tx + "\\n\\n";
+            } else if (t === 'PRE') {
+                const codeEl = ch.querySelector('code');
+                const code = codeEl ? codeEl.innerText : "";
+                out += code.replace(/\\n+$/, "") + "\\n\\n";
+            } else if (t === 'UL') {
+                out += listItems(ch, depth, false) + "\\n";
+            } else if (t === 'OL') {
+                out += listItems(ch, depth, true) + "\\n";
+            } else if (t === 'BLOCKQUOTE') {
+                const inner = block(ch, depth).trim();
+                inner.split("\\n").forEach((ln) => { out += "> " + ln + "\\n"; });
+                out += "\\n";
+            } else if (t === 'HR') {
+                out += "---\\n\\n";
+            } else if (t === 'TABLE') {
+                out += (ch.innerText || "") + "\\n\\n";
+            } else {
+                out += block(ch, depth);
+            }
+        });
+        return out;
+    };
+
+    let result = block(root, 0);
+    result = result.replace(/\\n{3,}/g, "\\n\\n");
     return result.trim();
 }"""
 

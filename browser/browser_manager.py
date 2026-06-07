@@ -23,6 +23,115 @@ from browser.file_extractor import click_download_buttons, collect_files
 
 warnings.filterwarnings('ignore', category=ResourceWarning)
 
+import re as _re_bm
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+_WE_HEADER = _re_bm.compile(r'<<<(?:WRITE|EDIT)\b[^>]*>>>', _re_bm.IGNORECASE)
+
+_LIVE_STATUS_RE = _re_bm.compile(
+    r'<<<(WRITE|EDIT|READ|BASH|GLOB|GREP|FETCH|TODO|TASK|ASK|MSG)([^>]*)>>>',
+    _re_bm.IGNORECASE,
+)
+_LIVE_PATH_RE = _re_bm.compile(r'path="([^"]*)"')
+_LIVE_PATTERN_RE = _re_bm.compile(r'pattern="([^"]*)"')
+# Частичный (ещё не закрытый '>>>') заголовок — модель только начала печатать '<<<VERB ...'
+_LIVE_PARTIAL_RE = _re_bm.compile(
+    r'<<<(WRITE|EDIT|READ|BASH|GLOB|GREP|FETCH|TODO|TASK|ASK|MSG)([^>]*)',
+    _re_bm.IGNORECASE,
+)
+_LIVE_PATH_LOOSE_RE = _re_bm.compile(r'path="([^"\n]*)')
+_LIVE_LABELS = {
+    "WRITE": "📝 пишет", "EDIT": "✏️ правит", "READ": "📖 читает",
+    "BASH": "🖥️ терминал", "GLOB": "🔍 поиск", "GREP": "🔎 grep",
+    "FETCH": "🌐 запрос", "TODO": "📋 план", "TASK": "📋 задача",
+    "ASK": "❓ вопрос", "MSG": "💬 пишет",
+}
+
+
+def _extract_live_status(text: str) -> str:
+    """Из живого потока вынуть «что модель делает прямо сейчас» для пульса."""
+    if not text:
+        return ""
+    matches = list(_LIVE_STATUS_RE.finditer(text))
+    if matches:
+        m = matches[-1]
+        verb = m.group(1).upper()
+        attrs = m.group(2) or ""
+        label = _LIVE_LABELS.get(verb, verb)
+        pm = _LIVE_PATH_RE.search(attrs)
+        gm = _LIVE_PATTERN_RE.search(attrs)
+        if pm:
+            return f"{label} {pm.group(1).rsplit('/', 1)[-1]}"
+        if gm:
+            return f"{label} {gm.group(1)}"
+        return label
+    # полного заголовка нет — но мог начаться частичный '<<<VERB ...' (без '>>>').
+    # Конвертим в чистый лейбл, чтобы сырой делимитер не мелькал текстом в Kilo.
+    partials = list(_LIVE_PARTIAL_RE.finditer(text))
+    if partials:
+        pm = partials[-1]
+        verb = pm.group(1).upper()
+        attrs = pm.group(2) or ""
+        label = _LIVE_LABELS.get(verb, verb)
+        ppath = _LIVE_PATH_LOOSE_RE.search(attrs)
+        if ppath and ppath.group(1).strip():
+            return f"{label} {ppath.group(1).rsplit('/', 1)[-1]}"
+        return label
+    # заголовков нет — отдаём хвост видимого текста (преамбула/размышление),
+    # срезая любой сырой '<<<' фрагмент
+    for ln in reversed(text.splitlines()):
+        cut = ln.find("<<<")
+        if cut != -1:
+            ln = ln[:cut]
+        ln = ln.strip()
+        if ln:
+            return "💭 " + (ln[:50] + "…" if len(ln) > 50 else ln)
+    return ""
+
+
+# Полный заголовок делимитера — для определения границы живого стрима.
+_STREAM_HEADER_RE = _re_bm.compile(
+    r'<<<(WRITE|EDIT|READ|BASH|GLOB|GREP|FETCH|TODO|TASK|ASK|MSG)([^>]*)>>>',
+    _re_bm.IGNORECASE,
+)
+
+
+def _stream_limit(text: str):
+    """Докуда сырой текст безопасно стримить живьём — (limit, hard).
+
+    MSG-тело — проза/markdown чата: стримим ЖИВЬЁМ (парсер срежет <<<MSG>>>/<<<END>>>).
+    Любой не-MSG делимитер (WRITE/EDIT/код/тулзы) — ЖЁСТКИЙ стоп: limit на нём,
+    hard=True → дальше атомарно из read_last_assistant (целостность кода > анимация).
+      • limit — индекс, докуда можно отдать прямо сейчас;
+      • hard  — True, если на limit подтверждённый не-MSG делимитер (стоп навсегда).
+    Полные '<<<MSG>>>'/'<<<END>>>' проматываются; незакрытый хвостовой '<<<...'
+    придерживается (hard=False) — может оказаться '<<<WRITE', ждём прояснения.
+    """
+    i = 0
+    while True:
+        j = text.find("<<<", i)
+        if j == -1:
+            return len(text), False
+        seg = text[j:]
+        m = _STREAM_HEADER_RE.match(seg)
+        if m:
+            if m.group(1).upper() == "MSG":
+                i = j + m.end()          # MSG-заголовок проматываем — тело стримим
+                continue
+            return j, True               # WRITE/EDIT/... — жёсткий стоп
+        if seg[:9].upper() == "<<<END>>>":
+            i = j + 9                     # конец блока — проматываем
+            continue
+        return j, False                  # незакрытый '<<<...' — мягкая придержка
+
 STOP_SELECTOR = 'button[aria-label="Stop generating"], button[data-testid="stop-button"]'
 SEND_SELECTOR = '[data-testid="send-button"], button[data-testid="composer-send-button"]'
 COMPOSER_SELECTOR = "#prompt-textarea"
@@ -55,6 +164,12 @@ class BrowserManager:
         self.browser = None
         self.page = None
         self._lock = asyncio.Lock()
+        self._current_model = None  # кэш выбранной модели: select_model — no-op если совпадает
+        self._live_status = ""  # живой статус генерации для heartbeat (что модель делает сейчас)
+
+    def get_live_status(self) -> str:
+        """Текущий статус генерации (что модель делает прямо сейчас). Для heartbeat."""
+        return self._live_status or ""
 
     def setup_profile(self):
         src = os.path.join(self.profiles_dir, self.profile_name)
@@ -146,217 +261,117 @@ class BrowserManager:
         return current_url(self.page)
 
     async def select_model(self, target_model: str):
-        """Переключение модели реальным кликом. Кнопка-переключатель ChatGPT —
-        обычно button[aria-haspopup="menu"], чей текст содержит модель
-        (Instant/Thinking/Auto). Фоллбэк — поиск по data-testid/aria-label
-        (на некоторых аккаунтах текст кнопки пустой и её можно опознать
-        только по этим атрибутам)."""
+        """Переключение модели на новом ChatGPT UI (Radix dropdown).
+        Триггер = button[aria-haspopup="menu"] с текстом-моделью или aria-label
+        'switch model'. Пункты = div[role="menuitemradio"][data-testid^="model-switcher-"];
+        текущая модель = пункт с aria-checked="true". Открытие — РЕАЛЬНЫЙ mouse_click
+        (click_element), иначе Radix не открывается. Кэш self._current_model — no-op
+        при совпадении (после первого успешного выбора в чате повторы мгновенны)."""
         target_low = target_model.strip().lower()
-        timeout_sec = 8.0
-        interval_sec = 0.3
-        start_time = time.perf_counter()
-        selector_btn = None
-        current_raw = ""
-        match_strategy = ""
-        candidates = []
-        attempt_count = 0
+        if self._current_model == target_low:
+            return  # уже на этой модели — мгновенный no-op
 
-        def _attr(b, name):
-            try:
-                v = b.attrs.get(name)
-                return (v or "").lower() if isinstance(v, str) else ""
-            except Exception:
-                return ""
+        SKIP_TID = ("history-item", "accounts-profile", "composer-plus")
+        SKIP_AL = ("conversation", "sidebar", "profile", "download", "add files",
+                   "dictation", "switch model", "more actions")
+        MODEL_KW = ("instant", "thinking", "auto", "extended", "standard", "legacy", "pro", "gpt")
 
-        while time.perf_counter() - start_time < timeout_sec:
-            attempt_count += 1
-            try:
-                buttons = await self.page.select_all("button")
-            except Exception:
-                buttons = []
-
-            candidates = []
-            for b in buttons or []:
-                try:
-                    if b.attrs.get("aria-haspopup") == "menu":
-                        candidates.append((b, (b.text_all or "").strip()))
-                except Exception:
-                    continue
-
-            # Стратегия 1: aria-haspopup="menu" + текст содержит instant/thinking/auto
-            for b, raw in candidates:
-                tl = raw.lower()
-                if any(k in tl for k in ("instant", "thinking", "auto")) and "project" not in tl and "share" not in tl:
-                    selector_btn = b
-                    current_raw = raw
-                    match_strategy = "haspopup+text"
-                    break
-
-            # Стратегия 2: aria-haspopup="menu" + aria-label/data-testid содержит model/модел
-            if not selector_btn:
-                for b, raw in candidates:
-                    al = _attr(b, "aria-label")
-                    tid = _attr(b, "data-testid")
-                    if ("model" in al or "модел" in al or "model" in tid):
-                        selector_btn = b
-                        current_raw = raw or al or tid
-                        match_strategy = f"haspopup+attr(al='{al[:30]}',tid='{tid[:30]}')"
-                        break
-
-            # Стратегия 3: любая кнопка с data-testid*="model-switcher" / aria-label model selector
-            if not selector_btn:
-                try:
-                    extra = await self.page.select_all(
-                        '[data-testid*="model"], [aria-label*="model" i], [aria-label*="Model"]'
-                    )
-                except Exception:
-                    extra = []
-                for b in extra or []:
-                    try:
-                        al = _attr(b, "aria-label")
-                        tid = _attr(b, "data-testid")
-                        if "switcher" in tid or "switch" in al or "select model" in al or "model" == al.strip() or "modell" in al:
-                            selector_btn = b
-                            current_raw = (b.text_all or "").strip() or al or tid
-                            match_strategy = f"attr-only(al='{al[:30]}',tid='{tid[:30]}')"
-                            break
-                        # любой результат селектора, у которого testid начинается с model-
-                        if tid.startswith("model-"):
-                            selector_btn = b
-                            current_raw = (b.text_all or "").strip() or al or tid
-                            match_strategy = f"testid-prefix(tid='{tid[:40]}')"
-                            break
-                    except Exception:
-                        continue
-
-            # Стратегия 4 (Atlas-аккаунты): aria-haspopup="menu" кнопка с текстом-режимом
-            # вроде 'Extended' / 'Standard' (не из чёрного списка sidebar/history/composer).
-            if not selector_btn:
-                BLACKLIST_TEXTS = {"recents", "projects", "search chats", ""}
-                BLACKLIST_AL = ("open conversation", "open sidebar", "close sidebar",
-                                "download apps", "add files", "composer", "send prompt",
-                                "start dictation", "turn on temporary")
-                for b, raw in candidates:
-                    try:
-                        al = _attr(b, "aria-label")
-                        tid = _attr(b, "data-testid")
-                        tlow = raw.lower().strip()
-                        if tlow in BLACKLIST_TEXTS:
-                            continue
-                        if any(bad in al for bad in BLACKLIST_AL):
-                            continue
-                        if "history-item" in tid or "composer-plus" in tid:
-                            continue
-                        # Это режим-кнопка Atlas-UI (Extended и т.п.) — берём её
-                        selector_btn = b
-                        current_raw = raw
-                        match_strategy = f"atlas-mode-btn(raw='{raw[:30]}')"
-                        break
-                    except Exception:
-                        continue
-
-            if selector_btn:
-                break
-
-            await asyncio.sleep(interval_sec)
-
-        logger.info("[{}] КНОПКИ-МЕНЮ aria-haspopup (всего {}, попыток={}, стратегия='{}'): {}",
-                    self.profile_name, len(candidates), attempt_count, match_strategy or "—",
-                    [t[:60] for _, t in candidates])
-
-        if not selector_btn:
-            # ДИАГНОСТИЧЕСКИЙ ДАМП: что вообще на странице?
-            try:
-                url_now = current_url(self.page)
-            except Exception:
-                url_now = "?"
-            try:
-                title_node = await self.page.evaluate("document.title")
-                page_title = str(title_node)[:120] if title_node else ""
-            except Exception:
-                page_title = "?"
-            # Все кнопки + aria-label первых 30
-            try:
-                all_btns = await self.page.select_all("button")
-            except Exception:
-                all_btns = []
-            btn_dump = []
-            for b in (all_btns or [])[:30]:
-                try:
-                    al = _attr(b, "aria-label")
-                    tid = _attr(b, "data-testid")
-                    hp = _attr(b, "aria-haspopup")
-                    txt = (b.text_all or "").strip()[:30]
-                    btn_dump.append(f"al='{al[:25]}' tid='{tid[:25]}' hp='{hp}' txt='{txt}'")
-                except Exception:
-                    continue
-            logger.warning("[{}] Кнопка выбора модели не найдена (target='{}'). URL='{}', title='{}'. Всего button={}. Дамп первых 30:",
-                           self.profile_name, target_model, url_now, page_title, len(all_btns or []))
-            for i, row in enumerate(btn_dump):
-                logger.warning("[{}]   btn[{}]: {}", self.profile_name, i, row)
-            return
-        logger.info("[{}] ТЕКУЩАЯ МОДЕЛЬ (raw): '{}' | target: '{}'",
-                    self.profile_name, current_raw, target_model)
-
-        # Определить, нужен ли клик: текущая модель содержит target (как substring, lowercase)
-        current_low = current_raw.lower()
-        if target_low in current_low:
-            logger.info("[{}] Модель уже соответствует target '{}' — переключение не нужно",
-                        self.profile_name, target_model)
-            return
-
-        # Клик по кнопке
-        if not await click_element(selector_btn):
-            logger.warning("[{}] Не удалось кликнуть переключатель модели", self.profile_name)
-            return
-        await asyncio.sleep(1.2)
+        # --- найти кнопку-триггер ---
+        trigger = None
         try:
-            items = await self.page.select_all(
-                '[role="menuitem"], [role="menuitemradio"], [role="option"]'
-            )
+            buttons = await self.page.select_all("button")
         except Exception:
-            items = []
-        logger.info("[{}] МЕНЮ МОДЕЛЕЙ ({}): {}", self.profile_name, len(items or []),
-                    [(it.text_all or "").strip()[:50] for it in (items or [])])
-
-        # Выбор пункта с верификацией
-        for it in items or []:
+            buttons = []
+        for b in buttons or []:
             try:
-                t = (it.text_all or "").strip().lower()
-                if target_low in t and "project" not in t:
-                    clicked_item_text = (it.text_all or "").strip()
-                    click_ok = await click_element(it)
-                    await asyncio.sleep(1.2)
-                    # ВЕРИФИКАЦИЯ: перечитываем кнопку (включая Atlas-режимы)
-                    try:
-                        buttons2 = await self.page.select_all("button")
-                        verified_raw = ""
-                        for b2 in buttons2 or []:
-                            try:
-                                if b2.attrs.get("aria-haspopup") == "menu":
-                                    txt2 = (b2.text_all or "").strip()
-                                    if any(k in txt2.lower() for k in ("instant", "thinking", "auto", "extended", "standard")):
-                                        verified_raw = txt2
-                                        break
-                            except Exception:
-                                continue
-                        if target_low in verified_raw.lower():
-                            logger.info("[{}] ✅ ВЕРИФИКАЦИЯ: модель переключена на '{}' (raw='{}')",
-                                        self.profile_name, target_model, verified_raw)
-                        elif click_ok and target_low in clicked_item_text.lower():
-                            # Косвенная верификация: клик прошёл по правильному пункту,
-                            # но Atlas-UI не показывает target в тексте кнопки (рендерит 'Extended' и т.п.)
-                            logger.info("[{}] ✅ ВЕРИФИКАЦИЯ (косвенная, Atlas-UI): клик по пункту '{}' выполнен, кнопка raw='{}'",
-                                        self.profile_name, clicked_item_text, verified_raw or "—")
-                        else:
-                            logger.warning("[{}] ⚠️ ВЕРИФИКАЦИЯ ПРОВАЛЕНА: target='{}', получено raw='{}', clicked_item='{}'",
-                                           self.profile_name, target_model, verified_raw, clicked_item_text)
-                    except Exception as ve:
-                        logger.warning("[{}] Верификация модели не удалась: {}", self.profile_name, ve)
-                    return
+                if (b.attrs.get("aria-haspopup") or "") != "menu":
+                    continue
+                tid = (b.attrs.get("data-testid") or "").lower()
+                al = (b.attrs.get("aria-label") or "").lower()
+                txt = (b.text_all or "").strip().lower()
+                if any(s in tid for s in SKIP_TID) or any(s in al for s in SKIP_AL):
+                    continue
+                # Композерная кнопка модели = единственная button[aria-haspopup=menu]
+                # с ВИДИМЫМ текстом модели (Instant/Thinking/Extended/Auto). НЕЛЬЗЯ
+                # матчить по aria-label 'model': на странице чата у каждого сообщения
+                # есть инлайновая 'Switch model', часто проскроленная за экран (y<0) —
+                # реальный клик по ней висит ~2 мин и меню не открывается.
+                if any(txt.startswith(k) for k in MODEL_KW):
+                    trigger = b
+                    break
             except Exception:
                 continue
-        logger.warning("[{}] Пункт модели '{}' не найден в меню", self.profile_name, target_model)
+        if trigger is None:
+            logger.warning("[{}] select_model: кнопка-триггер модели не найдена (target='{}')",
+                           self.profile_name, target_model)
+            return
+
+        # --- открыть меню реальным кликом ---
+        if not await click_element(trigger):
+            logger.warning("[{}] select_model: не удалось кликнуть триггер", self.profile_name)
+            return
+
+        # --- дождаться пунктов меню ---
+        items = []
+        for _ in range(12):  # до ~2.4с
+            await asyncio.sleep(0.2)
+            try:
+                raw = await self.page.select_all('[role="menuitemradio"]')
+            except Exception:
+                raw = []
+            items = [it for it in (raw or [])
+                     if (it.attrs.get("data-testid") or "").startswith("model-switcher-")]
+            if items:
+                break
+        if not items:
+            logger.warning("[{}] select_model: меню открылось, но пунктов модели нет", self.profile_name)
+            try:
+                await send_key(self.page, "Escape", 27)
+            except Exception:
+                pass
+            return
+
+        # --- разобрать пункты: текущий (aria-checked) + целевой ---
+        target_item = None
+        current_text = ""
+        for it in items:
+            try:
+                itxt = (it.text_all or "").strip()
+                if (it.attrs.get("aria-checked") or "").lower() == "true":
+                    current_text = itxt
+                if itxt.lower().startswith(target_low):
+                    target_item = it
+            except Exception:
+                continue
+        logger.info("[{}] select_model: текущая='{}', target='{}', пунктов={}",
+                    self.profile_name, current_text, target_model, len(items))
+
+        # уже на нужной модели — закрыть меню и закэшировать
+        if current_text.lower().startswith(target_low):
+            try:
+                await send_key(self.page, "Escape", 27)
+            except Exception:
+                pass
+            self._current_model = target_low
+            return
+
+        if target_item is None:
+            logger.warning("[{}] select_model: пункт '{}' не найден (есть: {})",
+                           self.profile_name, target_model,
+                           [(it.text_all or "").strip()[:20] for it in items])
+            try:
+                await send_key(self.page, "Escape", 27)
+            except Exception:
+                pass
+            return
+
+        # --- кликнуть целевой пункт ---
+        if await click_element(target_item):
+            self._current_model = target_low
+            logger.info("[{}] ✅ select_model: переключено на '{}'", self.profile_name, target_model)
+            await asyncio.sleep(0.3)
+        else:
+            logger.warning("[{}] select_model: клик по пункту '{}' не удался", self.profile_name, target_model)
 
     async def _handle_personality_popup(self):
         """Иногда (35%) кликает 'палец вверх' на поп-апе personality — мышью."""
@@ -372,8 +387,9 @@ class BrowserManager:
         except Exception:
             pass
 
-    async def send_prompt_and_stream(self, prompt_text: str, target_model: str, is_new_chat: bool, chat_url: str = None):
+    async def send_prompt_and_stream(self, prompt_text: str, target_model: str, is_new_chat: bool, chat_url: str = None, typed_segment: str = ""):
         async with self._lock:
+            self._live_status = ""  # сброс статуса от прошлого запроса
             # HEALTH CHECK: probe CDP — if tab is frozen/dead, reload before anything else.
             try:
                 await asyncio.wait_for(self.page.evaluate("1"), timeout=5.0)
@@ -396,15 +412,30 @@ class BrowserManager:
                 logger.debug("[{}] bring_to_front failed: {}", self.profile_name, _bt_err)
 
             if is_new_chat:
+                self._current_model = None  # новый чат может сбросить модель аккаунта — форс ре-селект
                 logger.info("[{}] === НАЧАЛО НОВОГО ЧАТА ===", self.profile_name)
-                await self.page.get(CHATGPT_URL)
+                try:
+                    await asyncio.wait_for(self.page.get(CHATGPT_URL), timeout=20.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[{}] ⏱️ page.get(new chat) таймаут 20с — окно свёрнуто/throttled? bring_to_front", self.profile_name)
+                    try:
+                        await asyncio.wait_for(self.page.bring_to_front(), timeout=5.0)
+                    except Exception:
+                        pass
                 await asyncio.sleep(3.5)
                 await self._apply_focus_emulation()
             elif chat_url:
                 current_url = await self.get_current_url()
                 if current_url.rstrip("/") != chat_url.rstrip("/"):
                     logger.info("[{}] === ПЕРЕХОД В ЧАТ {} ===", self.profile_name, chat_url)
-                    await self.page.get(chat_url)
+                    try:
+                        await asyncio.wait_for(self.page.get(chat_url), timeout=20.0)
+                    except asyncio.TimeoutError:
+                        logger.warning("[{}] ⏱️ page.get(chat) таймаут 20с — окно свёрнуто/throttled? bring_to_front", self.profile_name)
+                        try:
+                            await asyncio.wait_for(self.page.bring_to_front(), timeout=5.0)
+                        except Exception:
+                            pass
                     await asyncio.sleep(3.0)
                     await self._apply_focus_emulation()
                 else:
@@ -456,13 +487,29 @@ class BrowserManager:
 
             logger.info("[{}] Ввод промпта (длина {} символов)...", self.profile_name, len(prompt_text))
             await click_element(textarea)
-            await asyncio.sleep(0.4)
-            # Всегда нативная вставка (insert_text) — human_type слишком медленный для инжектов.
-            logger.info("[{}] Нативная вставка insert_text ({} симв)...", self.profile_name, len(prompt_text))
-            await insert_text_fast(self.page, prompt_text)
-            await asyncio.sleep(0.5)
-
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(0.15)
+            # Гибрид-ввод: систему/контекст/результаты тулзов ПАСТИМ (insert_text, мгновенно),
+            # а смысловой текст юзера ВПЕЧАТЫВАЕМ реальными key-событиями (человеко-ввод) на МАКС скорости.
+            seg = typed_segment.strip() if typed_segment else ""
+            idx = prompt_text.find(seg) if seg else -1
+            if seg and idx != -1:
+                pre = prompt_text[:idx]
+                post = prompt_text[idx + len(seg):]
+                logger.info("[{}] Гибрид-ввод: паста {} + впечатка {} + паста {} симв",
+                            self.profile_name, len(pre), len(seg), len(post))
+                if pre:
+                    await insert_text_fast(self.page, pre)
+                try:
+                    await textarea.send_keys(seg)
+                except Exception as _te:
+                    logger.debug("[{}] впечатка не удалась, фоллбэк паста: {}", self.profile_name, _te)
+                    await insert_text_fast(self.page, seg)
+                if post:
+                    await insert_text_fast(self.page, post)
+            else:
+                logger.info("[{}] Паста всего промпта ({} симв)...", self.profile_name, len(prompt_text))
+                await insert_text_fast(self.page, prompt_text)
+            await asyncio.sleep(0.1)
             send_btn = await find_element(self.page, SEND_SELECTOR, timeout=3)
 
             # Ждём пока кнопка станет enabled (composer на доли секунды дизейблит
@@ -496,9 +543,9 @@ class BrowserManager:
                 logger.info("[{}] 🔁 SUBMIT FALLBACK Enter (нет кнопки или клик не удался)", self.profile_name)
                 await send_key(self.page, "Enter", 13)
 
-            # Верификация: если через 0.7с textarea всё ещё содержит наш промпт
+            # Верификация: если через 0.4с textarea всё ещё содержит наш промпт
             # (или его начало), значит submit не сработал — досылаем Enter.
-            await asyncio.sleep(0.7)
+            await asyncio.sleep(0.4)
             try:
                 ta_now = await find_element(self.page, COMPOSER_SELECTOR, timeout=0.5)
                 ta_text = (ta_now.text_all or "") if ta_now else ""
@@ -535,6 +582,7 @@ class BrowserManager:
             # emitted: префикс НОВОГО ответа, уже отданный клиенту (стрим по 2 чтениям)
             emitted = ""
             started = False
+            delim_seen = False   # True после первого <<<делимитера>>> — дальше прозу не стримим
 
             def _cpl(a, b):
                 n = min(len(a), len(b))
@@ -567,26 +615,33 @@ class BrowserManager:
                     last_text = current_text
                     seen_activity = True
                     last_change = time.time()
+                    try:
+                        self._live_status = _extract_live_status(current_text)
+                    except Exception:
+                        pass
 
-                # новый ответ начался (отличается от того, что было до отправки)
+                # ЖИВОЙ СТРИМ ПРОЗЫ + ЧАТА (MSG). Лидирующая проза и тело <<<MSG>>>
+                # (markdown ответа в чат) — отдаём живьём, чтобы Kilo рисовал по мере
+                # генерации; парсер срежет маркеры <<<MSG>>>/<<<END>>>. Первый НЕ-MSG
+                # делимитер (WRITE/EDIT/код/тулзы) — стоп: досылаем атомарно из
+                # авторитетного read_last_assistant в финале (байт-в-байт, без риска
+                # порчи кода и дублей tool_calls). Инвариант: emitted всегда точный
+                # префикс будущего финала → конкатенация чанков == финал.
                 if not started and current_text and current_text != baseline:
                     started = True
-                    # prev_text оставляем = baseline → первый _cpl даст 0,
-                    # первый чанк подтвердится ВТОРЫМ чтением (анти-транзиент).
-
-                # СТАБИЛЬНЫЙ СТРИМИНГ: отдаём только префикс, совпавший в ДВУХ
-                # подряд чтениях DOM (отсекает транзиентные ре-рендеры markdown,
-                # плющащие маркер-строки) и только как чистое продолжение emitted.
-                if started:
-                    sp = _cpl(prev_text, current_text)
-                    prev_text = current_text
-                    if sp > len(emitted) and current_text[:len(emitted)] == emitted:
-                        chunk = current_text[len(emitted):sp]
-                        emitted = current_text[:sp]
-                        if chunk:
-                            if t_first_chunk is None:
-                                t_first_chunk = time.perf_counter()
-                            yield chunk
+                if not delim_seen and current_text != baseline and current_text.startswith(emitted):
+                    _hard_limit, _is_hard = _stream_limit(current_text)
+                    _stable = _cpl(prev_text, current_text)   # префикс, стабильный в 2 чтениях
+                    _limit = min(_hard_limit, _stable)
+                    if _is_hard and _stable >= _hard_limit:
+                        delim_seen = True                     # дошли до WRITE/EDIT — дальше атомарно
+                    _chunk = current_text[len(emitted):_limit]
+                    if _chunk:
+                        emitted += _chunk
+                        if t_first_chunk is None:
+                            t_first_chunk = time.perf_counter()
+                        yield _chunk
+                prev_text = current_text
 
                 if stop_present:
                     seen_activity = True
@@ -601,11 +656,11 @@ class BrowserManager:
                     last_focus_refresh = time.time()
 
                 # завершено: новый непустой текст, Stop исчез, текст стабилен ~2с
-                if last_text and last_text != baseline and not stop_present and (time.time() - last_change) >= 2.0:
+                if last_text and last_text != baseline and not stop_present and (time.time() - last_change) >= 1.5:
                     # Defensive: модель иногда шлёт короткое "ОК" → потом отдельное сообщение
                     # с tool-блоком. Подождём ещё 3с и перечитаем last_assistant; если текст
                     # изменился (новое сообщение) — продолжаем цикл.
-                    await asyncio.sleep(3.0)
+                    await asyncio.sleep(1.5)
                     post_text = await read_last_assistant(self.page)
                     if post_text and post_text != last_text:
                         logger.info("[{}] После 'завершения' появился новый текст — продолжаем", self.profile_name)
@@ -624,8 +679,16 @@ class BrowserManager:
                     logger.warning("[{}] Ответ не появился за 25с — выходим.", self.profile_name)
                     break
 
-                if time.time() - last_scroll >= random.uniform(1.5, 3.5):
-                    await human_scroll(self.page)
+                # Человеко-следование за растущим ответом: держим низ в виду (особенно
+                # для длинных ответов). Решительный скролл вниз + редкий взгляд вверх.
+                if time.time() - last_scroll >= random.uniform(0.8, 1.6):
+                    try:
+                        if random.random() < 0.12:
+                            await self.page.scroll_up(random.randint(30, 80))
+                        else:
+                            await self.page.scroll_down(random.randint(280, 520))
+                    except Exception:
+                        pass
                     last_scroll = time.time()
                 await asyncio.sleep(interval)
 
@@ -656,17 +719,18 @@ class BrowserManager:
                         "<<<WRITE" in final_text, "<<<END>>>" in final_text, "<<<EDIT" in final_text,
                         final_text[:200])
             if final_text:
-                # Инвариант: emitted — точный префикс финала. Если транзиент его
-                # нарушил — _cpl-фоллбэк (досылаем с точки расхождения).
+                if t_first_chunk is None:
+                    t_first_chunk = time.perf_counter()
                 if final_text.startswith(emitted):
                     tail = final_text[len(emitted):]
                 else:
-                    cp = _cpl(emitted, final_text)
-                    logger.warning("[{}] ⚠️ emitted разошёлся с финалом (cp={}, emitted={}) — _cpl-фоллбэк",
-                                   self.profile_name, cp, len(emitted))
-                    tail = final_text[cp:]
+                    _k = _cpl(emitted, final_text)
+                    tail = final_text[_k:]
+                    logger.warning("[{}] ⚠ стрим разошёлся с финалом на {}/{} — досыл общего хвоста",
+                                   self.profile_name, _k, len(emitted))
+                logger.info("[{}] 📤 yield: streamed={}, tail={}, total_final={}",
+                            self.profile_name, len(emitted), len(tail), len(final_text))
                 if tail:
-                    logger.info("[{}] 📤 yield tail: len={}", self.profile_name, len(tail))
                     yield tail
             t_post_start = time.perf_counter()
             t_scroll_start = time.perf_counter()
@@ -677,7 +741,6 @@ class BrowserManager:
             except Exception as e:
                 logger.warning("[{}] scroll_bottom ошибка: {}", self.profile_name, e)
             logger.info("[{}] ⏱ scroll_bottom: {:.2f}s", self.profile_name, time.perf_counter() - t_scroll_start)
-            await asyncio.sleep(0.3)
             t_click_start = time.perf_counter()
             clicked = await click_download_buttons(self.page)
             logger.info("[{}] ⏱ click_download_buttons: {:.2f}s, clicked={}",
@@ -693,9 +756,9 @@ class BrowserManager:
 
             t_popup_start = time.perf_counter()
             try:
-                await asyncio.wait_for(self._handle_personality_popup(), timeout=1.0)
+                await asyncio.wait_for(self._handle_personality_popup(), timeout=0.3)
             except asyncio.TimeoutError:
-                logger.warning("[{}] _handle_personality_popup таймаут 1s — пропускаем", self.profile_name)
+                logger.warning("[{}] _handle_personality_popup таймаут 0.3s — пропускаем", self.profile_name)
             logger.info("[{}] ⏱ popup: {:.2f}s", self.profile_name, time.perf_counter() - t_popup_start)
 
             # Сводка таймингов

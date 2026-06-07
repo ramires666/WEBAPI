@@ -5,13 +5,14 @@ import json
 import asyncio
 import os
 import time
+import glob
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from browser.browser_pool import BrowserPool
 from proxy.conversation_store import ConversationStore, client_fingerprint
 from proxy.token_counter import estimate_messages_tokens
 from proxy.context_summarizer import build_summary_prompt, save_summary, build_context_injection
-from config import AUTO_SUMMARY_ENABLED, TOKEN_LIMIT, PROFILES, PROFILES_DIR, WORK_DIR
+from config import AUTO_SUMMARY_ENABLED, TOKEN_LIMIT, PROFILES, PROFILES_DIR, WORK_DIR, DUMP_MAX_AGE_DAYS
 from loguru import logger
 
 app = FastAPI(title="ChatGPT API Proxy (Human-Mimic Edition)")
@@ -39,6 +40,22 @@ def dump_request(data: dict):
         )
     except Exception as e:
         logger.warning("Dump failed: {}", e)
+
+def cleanup_old_temp(max_age_days: int = DUMP_MAX_AGE_DAYS) -> int:
+    """Удаляет дамп-скрэтч в temp/ старше max_age_days (по mtime). Возвращает число удалённых."""
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    for pattern in ("request_dump_*.json", "timeout_dump_*.html"):
+        for path in glob.glob(os.path.join(DUMP_DIR, pattern)):
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                pass
+    if removed:
+        logger.info("🧹 temp cleanup: удалено {} файлов старше {}д", removed, max_age_days)
+    return removed
 
 browser_pool = BrowserPool(PROFILES, PROFILES_DIR, WORK_DIR)
 
@@ -85,6 +102,17 @@ def format_delta_prompt(delta_messages: List[ChatMessage], tools: Optional[List[
 
 @app.on_event("startup")
 async def startup_event():
+    cleanup_old_temp()
+
+    async def _temp_cleanup_loop():
+        while True:
+            await asyncio.sleep(24 * 3600)
+            try:
+                cleanup_old_temp()
+            except Exception as e:
+                logger.warning("temp cleanup loop failed: {}", e)
+
+    asyncio.create_task(_temp_cleanup_loop())
     await browser_pool.start_all()
 
 @app.on_event("shutdown")
@@ -217,6 +245,19 @@ async def chat_completions(request: ChatCompletionRequest):
     if context_prefix:
         prompt_text = context_prefix + prompt_text
 
+    # Смысловой текст последнего user-сообщения — его ВПЕЧАТАЕМ (человеко-ввод);
+    # систему/контекст/результаты тулзов — вставим пастой (insert_text).
+    typed_segment = ""
+    import re as _re_ts
+    for _m in delta_messages:
+        if _m.role == "user":
+            _c = _m.content
+            if isinstance(_c, list):
+                _c = " ".join(p.get("text", "") for p in _c if isinstance(p, dict) and p.get("type") == "text")
+            _c = _re_ts.sub(r'<environment_details>.*?</environment_details>', '', _c or "", flags=_re_ts.DOTALL).strip()
+            if _c:
+                typed_segment = _c
+
     if request.stream:
         from proxy.response_parser import ResponseParser
         async def event_generator():
@@ -226,36 +267,103 @@ async def chat_completions(request: ChatCompletionRequest):
             tool_acc = {}  # index -> {"name", "args"} для сборки stream tool_calls
             try:
                 # Используем выбранный браузер
-                chunk_stream = manager.send_prompt_and_stream(prompt_text, target_model, is_new_chat, chat_url)
-
-                # Мы всё равно сохраним полный ответ для истории
+                chunk_stream = manager.send_prompt_and_stream(prompt_text, target_model, is_new_chat, chat_url, typed_segment=typed_segment)
                 parser = ResponseParser()
-                async for chunk_data in parser.process_stream(chunk_stream, request.model):
-                    # chunk_data - это уже готовая строка вида "data: {...}\n\n"
-                    # Но нам нужно сохранить сырой текст (вместе с markdown), чтобы сохранить в history
-                    # Это сложно, поэтому просто извлекаем content из json
+
+                # ── Producer/consumer: пульс БЕЗ отмены генератора. ──────────────
+                # КРИТИЧНО: НЕЛЬЗЯ оборачивать parser.__anext__() в asyncio.wait_for —
+                # таймаут wait_for ОТМЕНЯЕТ корутину __anext__, бросая CancelledError
+                # ВНУТРЬ async-генератора браузера (page.get/sleep), что убивает всю
+                # отправку (генератор закрывается → следующий __anext__ = StopAsyncIteration
+                # → 0 чанков, в браузер ничего не печатается). Поэтому генератор крутится
+                # в отдельной задаче-producer и кладёт чанки в очередь, а consumer тут
+                # тянет из очереди с таймаутом 2.5с ради ПУЛЬСА — producer при этом жив.
+                queue = asyncio.Queue()
+                _SENTINEL = object()
+                _producer_exc = {}
+
+                async def _producer():
                     try:
-                        json_str = chunk_data.replace("data: ", "").strip()
-                        parsed = json.loads(json_str)
-                        delta = parsed["choices"][0]["delta"]
-                        if "content" in delta:
-                            full_reply += delta["content"]
-                        elif "tool_calls" in delta:
-                            # Стримовый tool_call: name+id только в первом чанке,
-                            # аргументы докапливаются по index в последующих.
-                            tc = delta["tool_calls"][0]
-                            idx = tc.get("index", 0)
-                            func = tc.get("function", {})
-                            if func.get("name"):
-                                tool_acc[idx] = {"name": func["name"], "args": func.get("arguments", "")}
-                                tool_call_count += 1
-                            elif idx in tool_acc:
-                                tool_acc[idx]["args"] += func.get("arguments", "")
-                    except:
+                        async for _cd in parser.process_stream(chunk_stream, request.model):
+                            await queue.put(_cd)
+                    except Exception as _pe:
+                        _producer_exc["e"] = _pe
+                    finally:
+                        await queue.put(_SENTINEL)
+
+                _prod_task = asyncio.create_task(_producer())
+                _hb_start = time.perf_counter()
+                _hb_last_status = ""
+                _hb_emitted = False
+                _hb_dots = 0
+                try:
+                    while True:
+                        try:
+                            chunk_data = await asyncio.wait_for(queue.get(), timeout=2.5)
+                        except asyncio.TimeoutError:
+                            # Генерация идёт — показываем ЖИВОЙ статус (что модель пишет/
+                            # делает прямо сейчас), вытащенный из потока браузером. Между
+                            # сменами статуса — точки через пробел, с секундами в скобках.
+                            # Producer НЕ трогаем. В full_reply пульс НЕ добавляем.
+                            _elapsed = int(time.perf_counter() - _hb_start)
+                            try:
+                                _status = manager.get_live_status().strip()
+                            except Exception:
+                                _status = ""
+                            if not _status:
+                                _status = "⏳ генерирую ответ"
+                            if _status != _hb_last_status:
+                                _hb_last_status = _status
+                                _hb_dots = 0
+                                _hb_txt = ("\n" if _hb_emitted else "") + f"{_status} ({_elapsed}с)"
+                                _hb_emitted = True
+                            else:
+                                _hb_dots += 1
+                                _hb_txt = f" ({_elapsed}с)" if _hb_dots % 8 == 0 else " ·"
+                            _hb = {
+                                "id": "chatcmpl-proxy",
+                                "object": "chat.completion.chunk",
+                                "model": request.model,
+                                "choices": [{"index": 0, "delta": {"content": _hb_txt}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(_hb)}\n\n"
+                            continue
+                        if chunk_data is _SENTINEL:
+                            break
+                        # ── real chunk: keep the EXISTING parse/accumulate logic verbatim ──
+                        try:
+                            json_str = chunk_data.replace("data: ", "").strip()
+                            parsed = json.loads(json_str)
+                            delta = parsed["choices"][0]["delta"]
+                            if "content" in delta:
+                                full_reply += delta["content"]
+                            elif "tool_calls" in delta:
+                                # Стримовый tool_call: name+id только в первом чанке,
+                                # аргументы докапливаются по index в последующих.
+                                tc = delta["tool_calls"][0]
+                                idx = tc.get("index", 0)
+                                func = tc.get("function", {})
+                                if func.get("name"):
+                                    tool_acc[idx] = {"name": func["name"], "args": func.get("arguments", "")}
+                                    tool_call_count += 1
+                                elif idx in tool_acc:
+                                    tool_acc[idx]["args"] += func.get("arguments", "")
+                        except:
+                            pass
+                        chunks_yielded += 1
+                        yield chunk_data
+                finally:
+                    # Клиент отвалился / выходим — гасим producer (и, как следствие,
+                    # генератор браузера), чтобы он не висел в фоне.
+                    if not _prod_task.done():
+                        _prod_task.cancel()
+                    try:
+                        await _prod_task
+                    except BaseException:
                         pass
 
-                    chunks_yielded += 1
-                    yield chunk_data
+                if _producer_exc.get("e"):
+                    raise _producer_exc["e"]
 
                 # Дособираем stream tool_calls в текст истории (после полного стрима)
                 for _idx in sorted(tool_acc):
@@ -276,7 +384,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     "id": "chatcmpl-proxy",
                     "object": "chat.completion.chunk",
                     "model": request.model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if tool_call_count > 0 else "stop"}]
                 }
                 yield f"data: {json.dumps(final_data)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -287,7 +395,7 @@ async def chat_completions(request: ChatCompletionRequest):
         return StreamingResponse(event_generator(), media_type="text/event-stream")
     else:
         full_text = ""
-        async for chunk in manager.send_prompt_and_stream(prompt_text, target_model, is_new_chat, chat_url):
+        async for chunk in manager.send_prompt_and_stream(prompt_text, target_model, is_new_chat, chat_url, typed_segment=typed_segment):
             full_text += chunk
 
         _url = await manager.get_current_url()

@@ -19,6 +19,8 @@ class ResponseParser:
     def __init__(self):
         self.buf = ""
         self._n = 0
+        self._tool_idx = -1        # глобальный index tool_call (0,1,2... в одном ответе)
+        self._w_index = 0          # index, выделенный открытому WRITE
         # Per-WRITE incremental streaming state (reset after <<<END>>>)
         self._w_active = False     # True while inside a streaming WRITE block
         self._w_id = ""            # tool_call id for the open WRITE
@@ -27,14 +29,19 @@ class ResponseParser:
         self._w_streamed = 0       # code-point count of content already sent to client
         self._w_lead_done = False  # True once the fence opening line has been skipped
         self._w_lead_end = 0       # offset within body (from _w_buf_start) after the fence lead line
+        self._w_opened = False     # True once the open chunk (name+filePath) was sent
 
     def _next_id(self) -> str:
         self._n += 1
         return f"call_local_{self._n}"
 
+    def _next_tool_index(self) -> int:
+        self._tool_idx += 1
+        return self._tool_idx
+
     def _needs_body(self, verb: str, attrs: dict) -> bool:
         """True if the block needs a closing <<<END>>>"""
-        return verb.upper() in ("WRITE", "EDIT", "BASH", "TODO", "TASK", "MSG")
+        return verb.upper() in ("WRITE", "EDIT", "BASH", "TODO", "TASK")
 
     async def process_stream(self, chunk_stream: AsyncGenerator[str, None], model: str):
         async for chunk in chunk_stream:
@@ -68,7 +75,7 @@ class ResponseParser:
                 "index": 0,
                 "delta": {
                     "tool_calls": [{
-                        "index": 0,
+                        "index": self._w_index,
                         "id": call_id,
                         "type": "function",
                         "function": {"name": "write", "arguments": arguments_prefix},
@@ -90,7 +97,7 @@ class ResponseParser:
                 "index": 0,
                 "delta": {
                     "tool_calls": [{
-                        "index": 0,
+                        "index": self._w_index,
                         "function": {"arguments": frag},
                     }]
                 },
@@ -109,11 +116,11 @@ class ResponseParser:
                 "index": 0,
                 "delta": {
                     "tool_calls": [{
-                        "index": 0,
+                        "index": self._w_index,
                         "function": {"arguments": '"}'},
                     }]
                 },
-                "finish_reason": "tool_calls",
+                "finish_reason": None,
             }],
         }
         return f"data: {json.dumps(data)}\n\n"
@@ -169,11 +176,13 @@ class ResponseParser:
                     # Enter incremental streaming mode
                     self._w_active = True
                     self._w_id = self._next_id()
+                    self._w_index = self._next_tool_index()
                     self._w_path = attrs.get("path", "")
                     self._w_buf_start = header_end  # body starts here in self.buf
                     self._w_streamed = 0
                     self._w_lead_done = False
                     self._w_lead_end = 0
+                    self._w_opened = False
                     chunks = self._drain_write_stream(model, final)
                     out.extend(chunks)
                     if self._w_active:
@@ -221,9 +230,10 @@ class ResponseParser:
         # Authoritative content via _strip_fence
         content = self._strip_fence(full_body)
 
-        # Emit opening chunk only if not yet done (streamed==0 means open not sent yet)
-        if self._w_streamed == 0:
+        # Emit opening chunk only if not yet done
+        if not self._w_opened:
             out.append(self._w_open_chunk(self._w_path, model))
+            self._w_opened = True
 
         # Emit remainder that wasn't streamed yet
         remainder = content[self._w_streamed:]
@@ -242,65 +252,19 @@ class ResponseParser:
         # Reset state
         self._w_active = False
         self._w_streamed = len(content)
+        self._w_opened = False
         return out
 
     def _w_stream_partial(self, raw_body: str, model: str) -> list:
-        """Stream as much of raw_body as is safe, managing fence lead and holdback.
-        Updates self._w_streamed, self._w_lead_done, self._w_lead_end in place.
-
-        _strip_fence logic (mirrored here for partial streaming):
-          1. s.strip("\\n")  — drop leading/trailing newlines
-          2. If first remaining line starts with ``` → skip that line (fence open)
-          3. If last line is ``` → skip it (fence close) — handled by holdback+flush
-
-        self._w_lead_end is an index into raw_body (NOT the lstripped version)
-        pointing to where content begins after the fence opening line (if any).
-        """
+        """File content is committed atomically at <<<END>>> from the authoritative
+        buffer. During streaming we ONLY emit the open chunk (tool name + filePath) so
+        the client immediately shows a 'write <file>' action and does not look hung.
+        The body itself is HELD and never streamed (prevents byte corruption on DOM
+        re-renders)."""
         out = []
-
-        # ── Phase 1: determine fence lead ────────────────────────────────
-        if not self._w_lead_done:
-            # Mirror _strip_fence: strip leading \n to find true first line
-            stripped_start = len(raw_body) - len(raw_body.lstrip("\n"))
-            after_lead_newlines = raw_body[stripped_start:]
-
-            # Need at least one complete line after the leading newlines
-            nl_idx = after_lead_newlines.find("\n")
-            if nl_idx == -1:
-                # Can't determine fence yet — hold everything
-                return out
-
-            first_line = after_lead_newlines[:nl_idx]
-            if first_line.lstrip().startswith("```"):
-                # Fence open line: content starts after this line's \n
-                self._w_lead_end = stripped_start + nl_idx + 1
-            else:
-                # No fence — content starts right after the leading \n stripping
-                # (strip leading \n the same way _strip_fence does strip("\n"))
-                self._w_lead_end = stripped_start
-            self._w_lead_done = True
-
-        # Content within raw_body starts at _w_lead_end
-        content_so_far = raw_body[self._w_lead_end:]
-
-        # Apply holdback: hold last _WRITE_HOLDBACK chars to avoid partial closing fence
-        safe_len = max(0, len(content_so_far) - _WRITE_HOLDBACK)
-        streamable = content_so_far[:safe_len]
-
-        # Only emit what hasn't been sent yet
-        if len(streamable) <= self._w_streamed:
-            return out
-
-        new_piece = streamable[self._w_streamed:]
-        if not new_piece:
-            return out
-
-        # First emission: send open chunk
-        if self._w_streamed == 0:
+        if not self._w_opened:
             out.append(self._w_open_chunk(self._w_path, model))
-
-        out.append(self._w_cont_chunk(new_piece, model))
-        self._w_streamed += len(new_piece)
+            self._w_opened = True
         return out
 
     # ------------------------------------------------------------------
@@ -433,13 +397,13 @@ class ResponseParser:
                 "index": 0,
                 "delta": {
                     "tool_calls": [{
-                        "index": 0,
+                        "index": self._next_tool_index(),
                         "id": self._next_id(),
                         "type": "function",
                         "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)},
                     }]
                 },
-                "finish_reason": "tool_calls",
+                "finish_reason": None,
             }],
         }
         return f"data: {json.dumps(data)}\n\n"

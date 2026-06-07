@@ -6,6 +6,7 @@
   пропускается в round-robin, прокси продолжает работу на оставшихся.
 """
 import asyncio
+import os
 from typing import Optional
 from loguru import logger
 from browser.browser_manager import BrowserManager
@@ -15,9 +16,24 @@ class BrowserPool:
     def __init__(self, profiles: list[str], profiles_dir: str, work_dir: str):
         self.managers: dict[str, BrowserManager] = {}
         self.unavailable: set[str] = set()
-        self._idx = 0
+        self._state_file = os.path.join(work_dir, "carousel_idx.txt")
+        self._idx = self._load_idx()
         for name in profiles:
             self.managers[name] = BrowserManager(name, profiles_dir, work_dir)
+
+    def _load_idx(self) -> int:
+        try:
+            with open(self._state_file, "r", encoding="utf-8") as f:
+                return int(f.read().strip())
+        except Exception:
+            return 0
+
+    def _save_idx(self) -> None:
+        try:
+            with open(self._state_file, "w", encoding="utf-8") as f:
+                f.write(str(self._idx))
+        except Exception as e:
+            logger.warning("[pool] не смог сохранить carousel_idx: {}", e)
 
     async def start_all(self):
         """Запуск всех браузеров параллельно. Упавшие → unavailable, не валим pool."""
@@ -55,6 +71,7 @@ class BrowserPool:
         if not names:
             raise RuntimeError("[pool] Нет доступных браузеров для нового чата")
         name = names[self._idx % len(names)]
-        self._idx = (self._idx + 1) % len(names)
-        logger.info("[pool] Новый чат → {}", name)
+        self._idx += 1
+        self._save_idx()
+        logger.info("[pool] Новый чат → {} (idx={})", name, self._idx)
         return name, self.managers[name]

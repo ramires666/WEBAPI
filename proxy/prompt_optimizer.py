@@ -54,7 +54,7 @@ Assistant:
 <<<END>>>
 """
 
-PROXY_REMINDER = "\n\n[PROXY PROTOCOL] Respond ONLY by emitting ONE PROXY MARKUP block (<<<VERB ...>>>...<<<END>>>). No Canvas, no downloads, no file attachments, no Atlas widgets — any output outside markers is DISCARDED by the proxy."
+PROXY_REMINDER = "\n\n[PROXY PROTOCOL] Respond ONLY with PROXY MARKUP blocks (<<<VERB ...>>>...<<<END>>>). Creating several files? Emit several WRITE blocks in THIS reply, one per file — NEVER bundle files into a BASH/Set-Content/echo script. No Canvas, no downloads, no attachments — any output outside markers is DISCARDED."
 
 def optimize_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Отфильтровывает ненужные инструменты и сильно урезает описания."""
