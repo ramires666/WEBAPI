@@ -1,3 +1,7 @@
+chcp 65001 | Out-Null
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 $src = "W:\_python\APIPROXY\Profile 2"
 $dst = "W:\_python\APIPROXY\Profile_Fixed"
 Write-Host "Creating fixed profile directory..."
